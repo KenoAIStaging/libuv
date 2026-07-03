@@ -243,6 +243,12 @@ typedef struct {
   UV_WAKEUP,                                                                  \
   UV_SIGNAL_REQ,
 
+/* Declared outside UV_REQ_PRIVATE_FIELDS: C++ does not permit declaring
+ * types inside an anonymous union. */
+struct uv__req_write_extra_s {
+  size_t nwritten;
+};
+
 #define UV_REQ_PRIVATE_FIELDS                                                 \
   union {                                                                     \
     /* Used by I/O operations */                                              \
@@ -263,9 +269,7 @@ typedef struct {
   struct uv_req_s* next_req;                                                  \
   union {                                                                     \
     void* reserved2[1];                                                       \
-    struct {                                                                  \
-      size_t nwritten;                                                        \
-    } write_extra;                                                            \
+    struct uv__req_write_extra_s write_extra;                                 \
   };
 
 #define UV_WRITE_PRIVATE_FIELDS \
