@@ -274,6 +274,10 @@ struct uv__req_write_extra_s {
 
 #define UV_WRITE_PRIVATE_FIELDS \
   int coalesced;                \
+  /* For pipe writes: the request whose OVERLAPPED was actually submitted   \
+   * to the kernel. Points to the request itself, unless the write was      \
+   * coalesced into a heap-allocated wrapper request. */                    \
+  struct uv_write_s* submitted_req;                                         \
   uv_buf_t write_buffer;        \
   HANDLE event_handle;          \
   HANDLE wait_handle;

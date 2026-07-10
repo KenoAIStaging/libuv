@@ -884,6 +884,7 @@ int uv__tcp_write(uv_loop_t* loop,
   req->handle = (uv_stream_t*) handle;
   req->cb = cb;
   req->write_extra.nwritten = 0;
+  req->submitted_req = req;
 
   /* Prepare the overlapped structure. */
   memset(&(req->u.io.overlapped), 0, sizeof(req->u.io.overlapped));

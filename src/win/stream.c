@@ -276,6 +276,15 @@ int uv__write_cancel(uv_write_t* req) {
         return uv__pipe_write_cancel_non_overlapped((uv_pipe_t*) stream, req);
       }
 
+      /* Multi-buffer and ipc writes are coalesced into a heap-allocated
+       * wrapper request, and it is the wrapper's OVERLAPPED that was
+       * submitted to the kernel, not the caller's. submitted_req points to
+       * the request that was actually submitted (the caller's request
+       * itself when no coalescing took place). The wrapper stays alive
+       * until its completion is processed on the loop thread, which resets
+       * the link, so it is never dereferenced after it has been freed. */
+      req = req->submitted_req;
+
       break;
     case UV_TTY:
       /* TTY writes complete synchronously on Windows, so cancellation

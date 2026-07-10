@@ -1686,7 +1686,13 @@ static int uv__build_coalesced_write_req(uv_write_t* user_req,
   coalesced_write_req = (uv__coalesced_write_t*) heap_buffer;
   coalesced_write_req->req = *user_req; /* copy (a) */
   coalesced_write_req->req.coalesced = 1;
+  coalesced_write_req->req.submitted_req = &coalesced_write_req->req;
   coalesced_write_req->user_req = user_req;         /* copy (b) */
+  /* It is the wrapper request's OVERLAPPED, not the user request's, that
+   * gets submitted to the kernel, so point the user request at the wrapper
+   * for cancellation. The link stays valid until the write completion is
+   * processed, which resets it before freeing the wrapper. */
+  user_req->submitted_req = &coalesced_write_req->req;
   heap_buffer_offset = sizeof *coalesced_write_req; /* offset (a) + (b) */
 
   /* Copy data buffers to the heap buffer. */
@@ -1726,6 +1732,7 @@ static int uv__pipe_write_data(uv_loop_t* loop,
   req->write_extra.nwritten = 0;
   /* Private fields. */
   req->coalesced = 0;
+  req->submitted_req = req;
   req->event_handle = NULL;
   req->wait_handle = INVALID_HANDLE_VALUE;
 
@@ -2308,6 +2315,10 @@ void uv__process_pipe_write_req(uv_loop_t* loop, uv_pipe_t* handle,
     uv__coalesced_write_t* coalesced_write =
         container_of(req, uv__coalesced_write_t, req);
     req = coalesced_write->user_req;
+    /* The wrapper is about to be freed; reset the cancellation link so a
+     * late uv_cancel() targets the user request's (never-submitted)
+     * OVERLAPPED and turns into the documented already-completed no-op. */
+    req->submitted_req = req;
     uv__free(coalesced_write);
   }
 

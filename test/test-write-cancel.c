@@ -151,9 +151,14 @@ TEST_IMPL(tcp_write_cancel) {
 /*
  * pipe_write_cancel / pipe_write_cancel_all
  *
- * uv_pipe() creates non-overlapped handles, so on Windows these exercise
- * the synchronous (thread pool) write cancellation path. Half the writes
- * use multiple buffers to exercise the coalesced write path.
+ * uv_pipe() with no flags creates non-overlapped handles, so on Windows
+ * these exercise the synchronous (thread pool) write cancellation path.
+ * The _overlapped variants pass UV_NONBLOCK_PIPE so that on Windows the
+ * handles are overlapped and cancellation goes through CancelIoEx. Half
+ * the writes use multiple buffers to exercise the coalesced write path,
+ * where the OVERLAPPED submitted to the kernel belongs to a heap-allocated
+ * wrapper request rather than the caller's request. The _ipc variant
+ * makes the writer an ipc pipe, whose framing writes are always coalesced.
  */
 static uv_pipe_t pipe_cancel_writer;
 static uv_pipe_t pipe_cancel_reader;
@@ -162,9 +167,9 @@ static char pipe_cancel_buf_data[64 * 1024];
 static int cancel_target;
 static uv_write_cb pipe_cancel_cb;
 
-static void pipe_cancel_setup(uv_loop_t* loop) {
+static void pipe_cancel_setup(uv_loop_t* loop, int pipe_flags, int ipc) {
   uv_buf_t bufs[4];
-  int fds[2];
+  uv_os_fd_t fds[2];
   int r;
   int i;
 
@@ -174,9 +179,9 @@ static void pipe_cancel_setup(uv_loop_t* loop) {
   closing = 0;
   memset(pipe_cancel_buf_data, 'D', sizeof(pipe_cancel_buf_data));
 
-  ASSERT_OK(uv_pipe(fds, 0, 0));
+  ASSERT_OK(uv_pipe(fds, pipe_flags, pipe_flags));
 
-  ASSERT_OK(uv_pipe_init(loop, &pipe_cancel_writer, 0));
+  ASSERT_OK(uv_pipe_init(loop, &pipe_cancel_writer, ipc));
   ASSERT_OK(uv_pipe_init(loop, &pipe_cancel_reader, 0));
 
   ASSERT_OK(uv_pipe_open(&pipe_cancel_writer, fds[1]));
@@ -233,14 +238,14 @@ static void pipe_cancel_write_cb_tail(uv_write_t* req, int status) {
     pipe_cancel_close();
 }
 
-TEST_IMPL(pipe_write_cancel) {
+static int pipe_write_cancel_run(int pipe_flags, int ipc) {
   uv_loop_t* loop;
   int i;
 
   loop = uv_default_loop();
   cancel_target = 5;
   pipe_cancel_cb = pipe_cancel_write_cb_tail;
-  pipe_cancel_setup(loop);
+  pipe_cancel_setup(loop, pipe_flags, ipc);
 
   /* Cancel the trailing writes which should be queued. */
   for (i = REQ_COUNT - 5; i < REQ_COUNT; i++)
@@ -255,19 +260,31 @@ TEST_IMPL(pipe_write_cancel) {
   return 0;
 }
 
+TEST_IMPL(pipe_write_cancel) {
+  return pipe_write_cancel_run(0, 0);
+}
+
+TEST_IMPL(pipe_write_cancel_overlapped) {
+  return pipe_write_cancel_run(UV_NONBLOCK_PIPE, 0);
+}
+
+TEST_IMPL(pipe_write_cancel_ipc) {
+  return pipe_write_cancel_run(UV_NONBLOCK_PIPE, 1);
+}
+
 static void pipe_cancel_write_cb_all(uv_write_t* req, int status) {
   write_cb_called++;
   if (status == UV_ECANCELED)
     cancelled_count++;
 }
 
-TEST_IMPL(pipe_write_cancel_all) {
+static int pipe_write_cancel_all_run(int pipe_flags, int ipc) {
   uv_loop_t* loop;
   int i;
 
   loop = uv_default_loop();
   pipe_cancel_cb = pipe_cancel_write_cb_all;
-  pipe_cancel_setup(loop);
+  pipe_cancel_setup(loop, pipe_flags, ipc);
 
   /* Cancel all writes. The first few may have already completed; one may be
    * currently blocking in the thread pool (on Windows). Both cases are
@@ -290,6 +307,14 @@ TEST_IMPL(pipe_write_cancel_all) {
 
   MAKE_VALGRIND_HAPPY(loop);
   return 0;
+}
+
+TEST_IMPL(pipe_write_cancel_all) {
+  return pipe_write_cancel_all_run(0, 0);
+}
+
+TEST_IMPL(pipe_write_cancel_all_overlapped) {
+  return pipe_write_cancel_all_run(UV_NONBLOCK_PIPE, 0);
 }
 
 
@@ -386,7 +411,7 @@ static void pipe_write_cb(uv_write_t* req, int status) {
 TEST_IMPL(pipe_write_nwritten) {
   uv_loop_t* loop;
   uv_buf_t buf;
-  int fds[2];
+  uv_os_fd_t fds[2];
 
   loop = uv_default_loop();
 
