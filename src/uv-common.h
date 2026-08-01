@@ -146,6 +146,16 @@ void uv__loop_close(uv_loop_t* loop);
 
 int uv__write_cancel(uv_write_t* req);
 
+/* The maximum number of bytes to hand to the kernel in a single read or
+ * write submission. macOS fails a write(2)/writev(2) of more than INT_MAX
+ * bytes outright with EINVAL, without attempting a partial write; Linux
+ * silently caps a single transfer at MAX_RW_COUNT (0x7ffff000) bytes and
+ * reports a short write. Bounding each submission to this value ourselves
+ * turns both behaviors into an ordinary short write that the caller
+ * continues, so a single request of arbitrary size can make progress.
+ */
+#define UV__IO_MAX_BYTES 0x7ffff000
+
 
 int uv__read_start(uv_stream_t* stream,
                    uv_alloc_cb alloc_cb,

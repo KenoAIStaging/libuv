@@ -755,7 +755,10 @@ static int uv__try_write(uv_stream_t* stream,
                          const uv_buf_t bufs[],
                          unsigned int nbufs,
                          uv_stream_t* send_handle) {
+  struct iovec capped;
   struct iovec* iov;
+  size_t submit_bytes;
+  int submit_cnt;
   int iovmax;
   int iovcnt;
   ssize_t n;
@@ -772,6 +775,32 @@ static int uv__try_write(uv_stream_t* stream,
   /* Limit iov count to avoid EINVALs from writev() */
   if (iovcnt > iovmax)
     iovcnt = iovmax;
+
+  /* Limit the number of bytes submitted per system call as well: macOS fails
+   * writes larger than INT_MAX bytes with EINVAL instead of performing a
+   * partial write, and Linux truncates the transfer at MAX_RW_COUNT
+   * (0x7ffff000) bytes anyway. Submit whole buffers as long as they fit under
+   * the cap so the caller's iov array is never modified; when the very first
+   * buffer is over the limit by itself, submit a capped slice of it. Either
+   * way the result is a short write that the caller continues, exactly as it
+   * would after a kernel-truncated write.
+   */
+  submit_bytes = 0;
+  for (submit_cnt = 0; submit_cnt < iovcnt; submit_cnt++) {
+    if (iov[submit_cnt].iov_len > UV__IO_MAX_BYTES - submit_bytes)
+      break;
+    submit_bytes += iov[submit_cnt].iov_len;
+  }
+
+  if (submit_cnt == 0) {
+    /* Note: iovcnt >= 1, so this buffer exists and is too large by itself. */
+    capped.iov_base = iov[0].iov_base;
+    capped.iov_len = UV__IO_MAX_BYTES;
+    iov = &capped;
+    submit_cnt = 1;
+  }
+
+  iovcnt = submit_cnt;
 
   /*
    * Now do the actual writev. Note that we've been updating the pointers
