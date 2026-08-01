@@ -139,6 +139,7 @@ static void uv__pipe_connection_init(uv_pipe_t* handle) {
   uv__connection_init((uv_stream_t*) handle);
   handle->read_req.data = handle;
   handle->pipe.conn.eof_timer = NULL;
+  handle->pipe.conn.read_data_event = NULL;
 }
 
 
@@ -1186,6 +1187,10 @@ void uv__pipe_close(uv_loop_t* loop, uv_pipe_t* handle) {
 
   if (handle->flags & UV_HANDLE_CONNECTION) {
     eof_timer_destroy(handle);
+    if (handle->pipe.conn.read_data_event != NULL) {
+      CloseHandle(handle->pipe.conn.read_data_event);
+      handle->pipe.conn.read_data_event = NULL;
+    }
   }
 
   if ((handle->flags & UV_HANDLE_CONNECTION)
@@ -2052,26 +2057,110 @@ static void uv__pipe_queue_ipc_xfer_info(
 }
 
 
-/* Read an exact number of bytes from a pipe. If an error or end-of-file is
- * encountered before the requested number of bytes are read, an error is
- * returned. */
-static int uv__pipe_read_exactly(HANDLE h, void* buffer, DWORD count) {
-  DWORD bytes_read, bytes_read_now;
+/* Read up to `len` bytes from a pipe, without ever blocking waiting for data
+ * to arrive. On success returns 0 and sets *bytes_read; *bytes_read == 0
+ * means that no data was available (only possible for len > 0 on overlapped
+ * handles, see below). On failure returns a system error code.
+ *
+ * Data reads are only issued after a zero-length "doorbell" read completed
+ * and PeekNamedPipe reported available bytes, but that report is merely a
+ * hint: the named pipe file system services reads for a peer's in-flight
+ * (pended) large write straight from the peer's buffer, and when the peer
+ * cancels that write the bytes it advertised are retracted. A synchronous
+ * read sized from a stale peek then blocks with the pipe still open,
+ * wedging the entire event loop behind it (and deadlocking outright when
+ * both pipe ends are driven by the same loop, since the cancellation's own
+ * completion can then never be processed).
+ *
+ * To close that race, issue the read overlapped and, if it does not
+ * complete synchronously - which can only be the retraction case, as data
+ * was available moments ago - cancel it right away. The cancellation either
+ * confirms that nothing was read, or loses a race with data that arrived in
+ * the meantime, which is then delivered normally. Either way the operation
+ * is over by the time this function returns: no buffer is left pinned by a
+ * pending read, and cancelled pipe I/O completes promptly, so the reaping
+ * wait below is bounded.
+ *
+ * The event's low-order bit is set so that the completion is never queued
+ * to the loop's completion port (this also keeps handles that are not
+ * associated with the port, e.g. UV_HANDLE_EMULATE_IOCP ones, working
+ * identically). Non-overlapped pipe handles cannot issue overlapped reads
+ * and keep their historical synchronous read.
+ */
+static int uv__pipe_try_read(uv_pipe_t* handle,
+                             void* buffer,
+                             DWORD len,
+                             DWORD* bytes_read) {
+  OVERLAPPED overlapped;
+  HANDLE event;
+  DWORD err;
 
-  bytes_read = 0;
-  while (bytes_read < count) {
-    if (!ReadFile(h,
-                  (char*) buffer + bytes_read,
-                  count - bytes_read,
-                  &bytes_read_now,
-                  NULL)) {
+  *bytes_read = 0;
+
+  if (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE) {
+    if (!ReadFile(handle->handle, buffer, len, bytes_read, NULL))
       return GetLastError();
-    }
-
-    bytes_read += bytes_read_now;
+    return 0;
   }
 
-  assert(bytes_read == count);
+  event = handle->pipe.conn.read_data_event;
+  if (event == NULL) {
+    event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (event == NULL)
+      return GetLastError();
+    handle->pipe.conn.read_data_event = event;
+  }
+
+  memset(&overlapped, 0, sizeof(overlapped));
+  overlapped.hEvent = (HANDLE) ((uintptr_t) event | 1);
+
+  if (ReadFile(handle->handle, buffer, len, bytes_read, &overlapped))
+    return 0; /* Completed synchronously; the common case. */
+
+  err = GetLastError();
+  if (err != ERROR_IO_PENDING)
+    return err;
+
+  /* The advertised bytes have been retracted. Cancel the read; if this loses
+   * a race with newly arrived data, that data is reaped and delivered below.
+   * CancelIoEx may fail with ERROR_NOT_FOUND if the read just completed; the
+   * operation must be reaped either way. */
+  CancelIoEx(handle->handle, &overlapped);
+  if (!GetOverlappedResult(handle->handle, &overlapped, bytes_read, TRUE)) {
+    err = GetLastError();
+    if (err != ERROR_OPERATION_ABORTED)
+      return err;
+    *bytes_read = 0; /* Cancelled before any data arrived. */
+  }
+  return 0;
+}
+
+
+/* Read an exact number of bytes from a pipe, without blocking waiting for
+ * data that is not there. Returns 0 and sets *bytes_read on success (with
+ * *bytes_read < count if the available data ran out before `count` bytes
+ * were read), or a system error code. */
+static int uv__pipe_read_exactly(uv_pipe_t* handle,
+                                 void* buffer,
+                                 DWORD count,
+                                 DWORD* bytes_read) {
+  DWORD bytes_read_now;
+  int err;
+
+  *bytes_read = 0;
+  while (*bytes_read < count) {
+    err = uv__pipe_try_read(handle,
+                            (char*) buffer + *bytes_read,
+                            count - *bytes_read,
+                            &bytes_read_now);
+    if (err)
+      return err;
+    if (bytes_read_now == 0)
+      break; /* No data available right now. */
+
+    *bytes_read += bytes_read_now;
+  }
+
   return 0;
 }
 
@@ -2082,6 +2171,7 @@ static DWORD uv__pipe_read_data(uv_loop_t* loop,
                                 DWORD max_bytes) {
   DWORD bytes_read;
   uv_buf_t buf;
+  int err;
 
   /* Ask the user for a buffer to read data into. */
   buf = uv_buf_init(NULL, 0);
@@ -2098,9 +2188,14 @@ static DWORD uv__pipe_read_data(uv_loop_t* loop,
   if (max_bytes > buf.len)
     max_bytes = buf.len;
 
-  /* Read into the user buffer. */
-  if (!ReadFile(handle->handle, buf.base, max_bytes, &bytes_read, NULL)) {
-    uv__pipe_read_error_or_eof(loop, handle, GetLastError(), buf);
+  /* Read into the user buffer. bytes_read == 0 here means the data that the
+   * preceding peek advertised was retracted by a peer cancelling its
+   * in-flight write; the buffer is handed back through the read callback
+   * (nread == 0, the documented "nothing read" indication) and the caller
+   * falls back to waiting for the next zero-read to complete. */
+  err = uv__pipe_try_read(handle, buf.base, max_bytes, &bytes_read);
+  if (err) {
+    uv__pipe_read_error_or_eof(loop, handle, err, buf);
     return 0; /* Break out of read loop. */
   }
 
@@ -2113,11 +2208,12 @@ static DWORD uv__pipe_read_data(uv_loop_t* loop,
 
 static DWORD uv__pipe_read_ipc(uv_loop_t* loop, uv_pipe_t* handle) {
   uint32_t* data_remaining = &handle->pipe.conn.ipc_data_frame.payload_remaining;
+  DWORD bytes_read;
   int err;
 
   if (*data_remaining > 0) {
     /* Read frame data payload. */
-    DWORD bytes_read =
+    bytes_read =
         uv__pipe_read_data(loop, handle, *data_remaining, *data_remaining);
     *data_remaining -= bytes_read;
     return bytes_read;
@@ -2131,9 +2227,18 @@ static DWORD uv__pipe_read_ipc(uv_loop_t* loop, uv_pipe_t* handle) {
 
     /* Read the IPC frame header. */
     err = uv__pipe_read_exactly(
-        handle->handle, &frame_header, sizeof frame_header);
+        handle, &frame_header, sizeof frame_header, &bytes_read);
     if (err)
       goto error;
+    if (bytes_read == 0)
+      return 0; /* The advertised bytes were retracted before any were read;
+                 * go back to waiting for the zero-read to complete. */
+    if (bytes_read < sizeof frame_header) {
+      /* The frame was retracted after part of it had already been consumed:
+       * a peer cancelled an in-flight write mid-frame. The frame stream
+       * cannot be re-synchronized; treat it like an invalid frame. */
+      goto invalid;
+    }
 
     /* Validate that flags are valid. */
     if ((frame_header.flags & ~UV__IPC_FRAME_VALID_FLAGS) != 0)
@@ -2170,10 +2275,15 @@ static DWORD uv__pipe_read_ipc(uv_loop_t* loop, uv_pipe_t* handle) {
     if (xfer_type == UV__IPC_SOCKET_XFER_NONE)
       return sizeof frame_header; /* Number of bytes read. */
 
-    /* Read transferred socket information. */
-    err = uv__pipe_read_exactly(handle->handle, &xfer_info, sizeof xfer_info);
+    /* Read transferred socket information. A short read means the frame was
+     * retracted mid-way by a peer cancelling its in-flight write; the frame
+     * stream cannot be re-synchronized after that. */
+    err = uv__pipe_read_exactly(handle, &xfer_info, sizeof xfer_info,
+                                &bytes_read);
     if (err)
       goto error;
+    if (bytes_read < sizeof xfer_info)
+      goto invalid;
 
     /* Store the pending socket info. */
     uv__pipe_queue_ipc_xfer_info(handle, xfer_type, &xfer_info);

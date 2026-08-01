@@ -363,6 +363,7 @@ struct uv__req_write_extra_s {
 
 #define uv_pipe_connection_fields                                             \
   uv_timer_t* eof_timer;                                                      \
+  HANDLE read_data_event;                                                     \
   uv_write_t* non_overlapped_write_active;                                    \
   volatile HANDLE writefile_thread_handle;                                    \
   DWORD ipc_remote_pid;                                                       \
