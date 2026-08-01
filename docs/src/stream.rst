@@ -230,6 +230,13 @@ API
     with other errors if the kernel finished processing the write before
     the cancellation took effect.
 
+    .. note::
+        On Windows, cancelling a write on an IPC pipe returns
+        ``UV_ENOTSUP`` once the write has been handed to the operating
+        system - which happens as soon as the request is made - because a
+        partially transmitted IPC frame would permanently desynchronize
+        the receiving end's message framing.
+
     .. versionadded:: 1.53.0
 
 .. c:function:: int uv_is_readable(const uv_stream_t* handle)

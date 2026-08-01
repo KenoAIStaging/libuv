@@ -308,6 +308,16 @@ int uv__write_cancel(uv_write_t* req) {
         return uv__pipe_write_cancel_non_overlapped((uv_pipe_t*) stream, req);
       }
 
+      /* Cancelling a write that is already on its way to the peer of an IPC
+       * pipe would truncate its frame mid-stream and permanently
+       * desynchronize the receiver's framing (the receiver would consume
+       * the next frame's header as leftover payload). IPC pipes are always
+       * overlapped, so a write request is submitted to the kernel as soon
+       * as it is made; there is no still-queued state in which cancelling
+       * would be safe. */
+      if (((uv_pipe_t*) stream)->ipc)
+        return UV_ENOTSUP;
+
       break;
     case UV_TTY:
       /* TTY writes complete synchronously on Windows, so cancellation
