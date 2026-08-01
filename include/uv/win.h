@@ -366,6 +366,10 @@ typedef struct {
 
 struct uv__req_write_extra_s {
   size_t nwritten;
+  /* Bytes of libuv-private framing (IPC frame header and socket-transfer
+   * record) included in this write's kernel submission; excluded from
+   * nwritten accounting. */
+  size_t ipc_frame_overhead;
 };
 
 #define UV_REQ_PRIVATE_FIELDS                                                 \

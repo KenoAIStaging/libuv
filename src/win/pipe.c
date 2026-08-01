@@ -1881,6 +1881,7 @@ static int uv__pipe_write_data(uv_loop_t* loop,
   req->send_handle = NULL;
   req->cb = cb;
   req->write_extra.nwritten = 0;
+  req->write_extra.ipc_frame_overhead = 0;
   /* Private fields. */
   req->coalesced = 0;
   req->event_handle = NULL;
@@ -2131,6 +2132,13 @@ int uv__pipe_write_ipc(uv_loop_t* loop,
   /* Write buffers. We set the `always_copy` flag, so it is not a problem that
    * some of the written data lives on the stack. */
   err = uv__pipe_write_data(loop, req, handle, bufs, buf_count, cb, 1);
+  if (err == 0) {
+    /* Everything before the caller's buffers is libuv-private framing;
+     * uv_write_nwritten() must report application payload only. */
+    req->write_extra.ipc_frame_overhead =
+        sizeof frame_header +
+        (xfer_type != UV__IPC_SOCKET_XFER_NONE ? sizeof xfer_info : 0);
+  }
 
   /* If we had to heap-allocate the bufs array, free it now. */
   if (bufs != stack_bufs) {
@@ -2569,6 +2577,16 @@ void uv__process_pipe_write_req(uv_loop_t* loop, uv_pipe_t* handle,
     req->write_buffer = uv_null_buf_;
   }
 
+  /* For IPC writes, count only the application's payload: the frame header
+   * and any socket-transfer record are libuv-private bytes that the
+   * application neither supplied nor observes. */
+  if (req->write_extra.ipc_frame_overhead > 0) {
+    if (bytes_written <= req->write_extra.ipc_frame_overhead)
+      bytes_written = 0;
+    else
+      bytes_written -= req->write_extra.ipc_frame_overhead;
+    req->write_extra.ipc_frame_overhead = 0;
+  }
   req->write_extra.nwritten += bytes_written;
 
   if (req->cb) {
