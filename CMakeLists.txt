@@ -590,6 +590,7 @@ if(LIBUV_BUILD_TESTS)
        test/test-ping-pong.c
        test/test-pipe-bind-error.c
        test/test-pipe-close-stdout-read-stdin.c
+       test/test-pipe-read-cancelled-write.c
        test/test-pipe-connect-error.c
        test/test-pipe-connect-multiple.c
        test/test-pipe-connect-prepare.c

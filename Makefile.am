@@ -221,6 +221,7 @@ test_run_tests_SOURCES = test/blackhole-server.c \
                          test/test-ping-pong.c \
                          test/test-pipe-bind-error.c \
                          test/test-pipe-connect-error.c \
+                         test/test-pipe-read-cancelled-write.c \
                          test/test-pipe-connect-multiple.c \
                          test/test-pipe-connect-prepare.c \
                          test/test-pipe-getsockname.c \
