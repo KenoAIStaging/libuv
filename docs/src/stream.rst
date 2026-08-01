@@ -231,6 +231,33 @@ API
     the cancellation took effect.
 
     .. note::
+        The value is unreliable for cancelled asynchronous (overlapped)
+        stream writes on Windows - TCP and named pipes alike: a cancelled
+        overlapped send can report a transfer count (including zero) that
+        does not reflect the bytes actually placed on the wire or already
+        consumed by the peer. For named pipes in particular, the operating
+        system reports a zero transfer count for a cancelled pended write
+        even when the peer has already consumed a prefix of the data.
+        Treat the value after such a cancellation as a lower bound at
+        best, not as an exact count. Synchronous (blocking) writes are
+        not affected: a cancelled blocking write reports its partial
+        count through the write call itself.
+
+    .. note::
+        On Windows, cancelling a TCP write may reset the connection,
+        depending on TCP state: ``CancelIoEx`` on an in-flight send can
+        abort a partially transmitted operation, and because the kernel
+        cannot withdraw bytes that have already reached the wire, the
+        stack may terminate the connection (RST) to preserve stream
+        integrity rather than leave the peer with a torn stream. A send
+        cancelled before any of its bytes reached the wire typically
+        leaves the connection intact. Callers should treat a cancelled
+        TCP write as potentially fatal to the connection and be prepared
+        for subsequent operations to fail with ``UV_ECONNRESET`` or
+        ``UV_ECONNABORTED``: cancellation is reliable as an abort
+        mechanism, not as a way to keep using the stream.
+
+    .. note::
         On Windows, cancelling a write on an IPC pipe returns
         ``UV_ENOTSUP`` once the write has been handed to the operating
         system - which happens as soon as the request is made - because a
