@@ -82,20 +82,6 @@ typedef struct {
 STATIC_ASSERT(sizeof(uv__ipc_frame_header_t) == 16);
 STATIC_ASSERT(sizeof(uv__ipc_socket_xfer_info_t) == 632);
 
-/* Coalesced write request. */
-typedef struct {
-  uv_write_t req;       /* Internal heap-allocated write request. */
-  uv_write_t* user_req; /* Pointer to user-specified uv_write_t. */
-} uv__coalesced_write_t;
-
-
-static uv_write_t* uv__coalesced_write_user_req(uv_write_t* req) {
-  if (req->coalesced)
-    return container_of(req, uv__coalesced_write_t, req)->user_req;
-  return req;
-}
-
-
 static void eof_timer_init(uv_pipe_t* pipe);
 static void eof_timer_start(uv_pipe_t* pipe);
 static void eof_timer_stop(uv_pipe_t* pipe);
@@ -1083,7 +1069,7 @@ static uv_write_t* uv__remove_specific_non_overlapped_write_req(
   prev = tail;
   curr = (uv_write_t*) tail->next_req;
   do {
-    if (uv__coalesced_write_user_req(curr) == target)
+    if (uv__write_user_req(curr) == target)
       return uv__remove_non_overlapped_write_req_after(handle, prev);
 
     prev = curr;
@@ -1102,7 +1088,7 @@ int uv__pipe_write_cancel_non_overlapped(uv_pipe_t* handle, uv_write_t* req) {
 
   /* On the thread pool - send the cancellation signal. */
   if (handle->pipe.conn.non_overlapped_write_active != NULL &&
-      uv__coalesced_write_user_req(
+      uv__write_user_req(
           handle->pipe.conn.non_overlapped_write_active) == req) {
     /* N.B.: It's possible to end up here multiple times if `req` is cancelled
      * again after an initial cancellation, but before the completion is processed.
@@ -1197,6 +1183,12 @@ void uv__pipe_close(uv_loop_t* loop, uv_pipe_t* handle) {
        * avoid putting things on the thread pool only for them to come straight
        * back with an invalid handle error. */
       uv__pipe_flush_non_overlapped_writes(handle);
+    } else {
+      /* Writes deferred behind an in-progress chunked write have no kernel
+       * operation outstanding; complete them as cancelled directly. The
+       * active chunked write, if any, is aborted by the handle closing
+       * below and stops at its next chunk boundary. */
+      uv__stream_flush_deferred_writes((uv_stream_t*) handle);
     }
 
     /* This will eventually destroy the write queue for us too. */
@@ -1441,8 +1433,10 @@ done:
 static DWORD WINAPI uv_pipe_writefile_thread_proc(void* parameter) {
   int result;
   HANDLE thread;
+  DWORD chunk;
   DWORD bytes;
   DWORD err;
+  size_t total_written;
   uv_write_t* req = (uv_write_t*) parameter;
   uv_pipe_t* handle = (uv_pipe_t*) req->handle;
   uv_loop_t* loop = handle->loop;
@@ -1453,31 +1447,45 @@ static DWORD WINAPI uv_pipe_writefile_thread_proc(void* parameter) {
   assert(req->type == UV_WRITE);
   assert(handle->type == UV_NAMED_PIPE);
 
-  bytes = 0;
+  total_written = 0;
 
   err = uv__pipe_begin_synchronous_io(thread_ptr, lock, &thread);
   if (err)
     goto done;
 
-  result = WriteFile(handle->handle,
-                     req->write_buffer.base,
-                     req->write_buffer.len,
-                     &bytes,
-                     NULL);
+  /* Write in bounded chunks: very large synchronous writes can fail with
+   * resource errors, and bounded chunks give CancelSynchronousIo (which the
+   * write-cancellation path keeps retrying until it lands) periodic
+   * opportunities to interrupt the write. */
+  do {
+    chunk = UV__MAX_WRITE_CHUNK;
+    if (req->write_buffer.len - total_written < chunk)
+      chunk = (DWORD) (req->write_buffer.len - total_written);
 
-  if (!result)
-    err = GetLastError();
+    bytes = 0;
+    result = WriteFile(handle->handle,
+                       req->write_buffer.base + total_written,
+                       chunk,
+                       &bytes,
+                       NULL);
+    total_written += bytes;
+
+    if (!result) {
+      err = GetLastError();
+      break;
+    }
+  } while (total_written < req->write_buffer.len);
 
   uv__pipe_end_synchronous_io(thread_ptr, lock, thread);
 
 done:
   /* If CancelSynchronousIo fired after WriteFile already finished writing
    * all the data, treat it as a successful write rather than a cancellation. */
-  if (err == ERROR_OPERATION_ABORTED && bytes == req->write_buffer.len)
+  if (err == ERROR_OPERATION_ABORTED && total_written == req->write_buffer.len)
     err = 0;
   if (err)
     SET_REQ_ERROR(req, err);
-  SET_REQ_NWRITTEN(req, bytes);
+  SET_REQ_NWRITTEN(req, total_written);
 
   POST_COMPLETION_FOR_REQ(loop, req);
   return 0;
@@ -1706,6 +1714,116 @@ static int uv__build_coalesced_write_req(uv_write_t* user_req,
 }
 
 
+/* Submit the next bounded chunk of a chunked write request. Called for the
+ * first chunk from uv__pipe_queue_chunked_write / the deferred-write drain,
+ * and for subsequent chunks from uv__process_pipe_write_req. Submission
+ * failures are reported through the completion path. */
+static void uv__pipe_chunked_write_submit(uv_loop_t* loop,
+                                          uv_pipe_t* handle,
+                                          uv_write_t* req) {
+  uv_buf_t* buf;
+  DWORD len;
+  int result;
+
+  assert(handle->stream.conn.chunked_write == req);
+  assert(req->bufs != NULL);
+  assert(req->write_index < req->nbufs);
+  assert(!(handle->flags &
+           (UV_HANDLE_BLOCKING_WRITES | UV_HANDLE_NON_OVERLAPPED_PIPE)));
+
+  /* WriteFile takes a single buffer, so submit a bounded slice of the
+   * current buffer per chunk. */
+  buf = req->bufs + req->write_index;
+  len = buf->len;
+  if (len > UV__MAX_WRITE_CHUNK)
+    len = UV__MAX_WRITE_CHUNK;
+
+  /* Prepare the overlapped structure for (re)submission. */
+  memset(&req->u.io.overlapped, 0, sizeof(req->u.io.overlapped));
+  if (handle->flags & UV_HANDLE_EMULATE_IOCP)
+    req->u.io.overlapped.hEvent = (HANDLE) ((uintptr_t) req->event_handle | 1);
+
+  result = WriteFile(handle->handle,
+                     buf->base,
+                     len,
+                     NULL,
+                     &req->u.io.overlapped);
+
+  if (!result && GetLastError() != ERROR_IO_PENDING) {
+    /* The submission failed outright; report the error later. Note that the
+     * overlapped was zeroed above, so InternalHigh reports zero bytes. */
+    SET_REQ_ERROR(req, GetLastError());
+    uv__insert_pending_req(loop, (uv_req_t*) req);
+    return;
+  }
+
+  /* Whether the chunk completed synchronously or was queued, a completion
+   * notification arrives through the completion port; pipe handles are not
+   * put in FILE_SKIP_COMPLETION_PORT_ON_SUCCESS mode. For emulated IOCP the
+   * notification comes from the waited-on event instead: the wait persists
+   * across chunk submissions, so register it only once per request. */
+  if (handle->flags & UV_HANDLE_EMULATE_IOCP &&
+      req->wait_handle == INVALID_HANDLE_VALUE) {
+    if (!RegisterWaitForSingleObject(&req->wait_handle,
+        req->event_handle, post_completion_write_wait, (void*) req,
+        INFINITE, WT_EXECUTEINWAITTHREAD)) {
+      SET_REQ_ERROR(req, GetLastError());
+      uv__insert_pending_req(loop, (uv_req_t*) req);
+    }
+  }
+}
+
+
+/* Route a write request through the bounded-chunk path: keep a copy of the
+ * buffer descriptors (the data itself stays owned by the caller until the
+ * callback, as for any write) and either start submitting chunks or, when
+ * another chunked write is already in progress, park the request behind it
+ * so that data from different requests cannot interleave in the pipe. */
+static int uv__pipe_queue_chunked_write(uv_loop_t* loop,
+                                        uv_write_t* req,
+                                        uv_pipe_t* handle,
+                                        const uv_buf_t bufs[],
+                                        size_t nbufs,
+                                        size_t total) {
+  req->bufs = req->bufsml;
+  if (nbufs > ARRAY_SIZE(req->bufsml))
+    req->bufs = uv__malloc(nbufs * sizeof(bufs[0]));
+
+  if (req->bufs == NULL) {
+    if (req->event_handle != NULL) {
+      CloseHandle(req->event_handle);
+      req->event_handle = NULL;
+    }
+    return ERROR_NOT_ENOUGH_MEMORY;
+  }
+
+  if (nbufs == 0) {
+    /* Represent an empty write as a single empty buffer. */
+    req->bufs[0] = uv_buf_init(NULL, 0);
+    nbufs = 1;
+  } else {
+    memcpy(req->bufs, bufs, nbufs * sizeof(bufs[0]));
+  }
+  req->nbufs = (unsigned int) nbufs;
+  req->write_index = 0;
+  req->u.io.queued_bytes = total;
+
+  REGISTER_HANDLE_REQ(loop, handle, req);
+  handle->reqs_pending++;
+  handle->stream.conn.write_reqs_pending++;
+  handle->write_queue_size += total;
+
+  if (handle->stream.conn.chunked_write != NULL) {
+    uv__stream_defer_write((uv_stream_t*) handle, req);
+  } else {
+    handle->stream.conn.chunked_write = req;
+    uv__pipe_chunked_write_submit(loop, handle, req);
+  }
+
+  return 0;
+}
+
+
 static int uv__pipe_write_data(uv_loop_t* loop,
                                uv_write_t* req,
                                uv_pipe_t* handle,
@@ -1715,6 +1833,7 @@ static int uv__pipe_write_data(uv_loop_t* loop,
                                int copy_always) {
   int err;
   int result;
+  int chunked;
   uv_buf_t write_buf;
 
   assert(handle->handle != INVALID_HANDLE_VALUE);
@@ -1726,6 +1845,8 @@ static int uv__pipe_write_data(uv_loop_t* loop,
   req->write_extra.nwritten = 0;
   /* Private fields. */
   req->coalesced = 0;
+  req->bufs = NULL;
+  req->cancel_requested = 0;
   req->event_handle = NULL;
   req->wait_handle = INVALID_HANDLE_VALUE;
 
@@ -1739,6 +1860,31 @@ static int uv__pipe_write_data(uv_loop_t* loop,
     req->u.io.overlapped.hEvent = (HANDLE) ((uintptr_t) req->event_handle | 1);
   }
   req->write_buffer = uv_null_buf_;
+
+  /* Writes larger than UV__MAX_WRITE_CHUNK are fed to the kernel in bounded
+   * chunks: Windows can fail huge writes with resource errors, and a single
+   * overlapped operation cannot report more than a DWORD of transferred
+   * bytes. For overlapped pipes the chunks are submitted asynchronously one
+   * after another, and while such a write is in progress every other write
+   * is queued behind it to preserve the pipe's byte order; blocking and
+   * non-overlapped pipes, which write synchronously (and one request at a
+   * time, respectively), simply loop over the chunks in place. */
+  chunked = 0;
+  if (!(handle->flags &
+        (UV_HANDLE_BLOCKING_WRITES | UV_HANDLE_NON_OVERLAPPED_PIPE))) {
+    size_t total = uv__count_bufs(bufs, (unsigned int) nbufs);
+
+    chunked = total > UV__MAX_WRITE_CHUNK ||
+              handle->stream.conn.chunked_write != NULL;
+
+    if (chunked && !copy_always) {
+      /* Skip coalescing: the caller's data buffers stay valid until the
+       * callback fires, so the chunked path can walk them in place. This is
+       * also what lets a single request exceed the 4 GB coalescing limit. */
+      return uv__pipe_queue_chunked_write(loop, req, handle, bufs, nbufs,
+                                          total);
+    }
+  }
 
   if (nbufs == 0) {
     /* Write empty buffer. */
@@ -1754,22 +1900,45 @@ static int uv__pipe_write_data(uv_loop_t* loop,
       return err;
   }
 
+  if (chunked) {
+    /* A large IPC write: the frame was coalesced into a single heap buffer
+     * (which is what allows the stack-allocated frame header to be copied),
+     * and that buffer is submitted in bounded chunks. */
+    assert(copy_always);
+    return uv__pipe_queue_chunked_write(loop, req, handle, &write_buf, 1,
+                                        write_buf.len);
+  }
+
   if ((handle->flags &
       (UV_HANDLE_BLOCKING_WRITES | UV_HANDLE_NON_OVERLAPPED_PIPE)) ==
       (UV_HANDLE_BLOCKING_WRITES | UV_HANDLE_NON_OVERLAPPED_PIPE)) {
     DWORD bytes;
-    result =
-        WriteFile(handle->handle, write_buf.base, write_buf.len, &bytes, NULL);
+    size_t total_written = 0;
 
-    if (!result) {
-      err = GetLastError();
-      return err;
-    } else {
-      /* Request completed immediately. */
-      req->u.io.queued_bytes = 0;
-    }
+    /* Write in bounded chunks; see the comment above. */
+    do {
+      DWORD chunk = UV__MAX_WRITE_CHUNK;
+      if (write_buf.len - total_written < chunk)
+        chunk = (DWORD) (write_buf.len - total_written);
 
-    SET_REQ_NWRITTEN(req, bytes);
+      bytes = 0;
+      result = WriteFile(handle->handle,
+                         write_buf.base + total_written,
+                         chunk,
+                         &bytes,
+                         NULL);
+      total_written += bytes;
+
+      if (!result) {
+        err = GetLastError();
+        return err;
+      }
+    } while (total_written < write_buf.len);
+
+    /* Request completed immediately. */
+    req->u.io.queued_bytes = 0;
+
+    SET_REQ_NWRITTEN(req, total_written);
     REGISTER_HANDLE_REQ(loop, handle, req);
     handle->reqs_pending++;
     handle->stream.conn.write_reqs_pending++;
@@ -1790,37 +1959,53 @@ static int uv__pipe_write_data(uv_loop_t* loop,
     req->u.io.queued_bytes = write_buf.len;
     handle->write_queue_size += req->u.io.queued_bytes;
   } else if (handle->flags & UV_HANDLE_BLOCKING_WRITES) {
-    /* Using overlapped IO, but wait for completion before returning */
-    result = WriteFile(handle->handle,
-                       write_buf.base,
-                       write_buf.len,
-                       NULL,
-                       &req->u.io.overlapped);
+    /* Using overlapped IO, but wait for completion before returning.
+     * Write in bounded chunks; see the comment near the top. */
+    size_t total_written = 0;
 
-    if (!result && GetLastError() != ERROR_IO_PENDING) {
-      err = GetLastError();
-      CloseHandle(req->event_handle);
-      req->event_handle = NULL;
-      return err;
-    }
+    do {
+      DWORD chunk = UV__MAX_WRITE_CHUNK;
+      if (write_buf.len - total_written < chunk)
+        chunk = (DWORD) (write_buf.len - total_written);
 
-    if (result) {
-      /* Request completed immediately. */
-      req->u.io.queued_bytes = 0;
-    } else {
-      /* Request queued by the kernel. */
-      req->u.io.queued_bytes = write_buf.len;
-      handle->write_queue_size += req->u.io.queued_bytes;
-      if (WaitForSingleObject(req->event_handle, INFINITE) !=
-          WAIT_OBJECT_0) {
+      memset(&req->u.io.overlapped, 0, sizeof(req->u.io.overlapped));
+      req->u.io.overlapped.hEvent =
+          (HANDLE) ((uintptr_t) req->event_handle | 1);
+
+      result = WriteFile(handle->handle,
+                         write_buf.base + total_written,
+                         chunk,
+                         NULL,
+                         &req->u.io.overlapped);
+
+      if (!result && GetLastError() != ERROR_IO_PENDING) {
         err = GetLastError();
         CloseHandle(req->event_handle);
         req->event_handle = NULL;
         return err;
       }
-    }
+
+      if (!result) {
+        /* Chunk queued by the kernel; wait for it to complete. */
+        if (WaitForSingleObject(req->event_handle, INFINITE) !=
+            WAIT_OBJECT_0) {
+          err = GetLastError();
+          CloseHandle(req->event_handle);
+          req->event_handle = NULL;
+          return err;
+        }
+      }
+
+      total_written += req->u.io.overlapped.InternalHigh;
+    } while (total_written < write_buf.len);
+
     CloseHandle(req->event_handle);
     req->event_handle = NULL;
+
+    /* The whole request has been written; report it as having completed
+     * immediately. */
+    req->u.io.queued_bytes = 0;
+    SET_REQ_NWRITTEN(req, total_written);
 
     REGISTER_HANDLE_REQ(loop, handle, req);
     handle->reqs_pending++;
@@ -2266,11 +2451,59 @@ void uv__process_pipe_write_req(uv_loop_t* loop, uv_pipe_t* handle,
 
   assert(handle->type == UV_NAMED_PIPE);
 
-  assert(handle->write_queue_size >= req->u.io.queued_bytes);
-  handle->write_queue_size -= req->u.io.queued_bytes;
-  /* Ask the kernel how many bytes were actually written.
-   * N.B.: If the write was partially cancelled, this could differ from queued_bytes. */
-  bytes_written = req->u.io.overlapped.InternalHigh;
+  if (req->bufs != NULL) {
+    /* Chunked write: account for the chunk that just completed and, unless
+     * the request is finished (or failed, or was cancelled), submit the next
+     * chunk while keeping the request pending. */
+    int done;
+
+    done = uv__write_req_chunk_update((uv_stream_t*) handle, req,
+                                      req->u.io.overlapped.InternalHigh);
+
+    if (REQ_SUCCESS(req) && !done && !req->cancel_requested &&
+        !(handle->flags & UV_HANDLE_CLOSING)) {
+      uv__pipe_chunked_write_submit(loop, handle, req);
+      return;
+    }
+
+    if (REQ_SUCCESS(req) && !done) {
+      /* Cancelled - or overtaken by a close - between chunks. */
+      SET_REQ_ERROR(req, ERROR_OPERATION_ABORTED);
+    }
+
+    /* The request is complete: successfully, in error or cancelled. Release
+     * the unwritten remainder (zero on success). If this request was driving
+     * the chunk pipeline, promote the next deferred write. The byte count
+     * has already been accumulated chunk by chunk; move it aside so that the
+     * shared completion code below can transfer it to the user-visible
+     * request (which, for a coalesced write, is a different structure). */
+    assert(handle->write_queue_size >= req->u.io.queued_bytes);
+    handle->write_queue_size -= req->u.io.queued_bytes;
+    req->u.io.queued_bytes = 0;
+    uv__write_req_chunk_cleanup(req);
+    bytes_written = req->write_extra.nwritten;
+    req->write_extra.nwritten = 0;
+
+    if (handle->stream.conn.chunked_write == req) {
+      uv_write_t* next;
+
+      handle->stream.conn.chunked_write = NULL;
+      next = uv__stream_deferred_write_dequeue((uv_stream_t*) handle);
+      if (next != NULL) {
+        /* Deferred writes are flushed before the handle starts closing. */
+        assert(!(handle->flags & UV_HANDLE_CLOSING));
+        handle->stream.conn.chunked_write = next;
+        uv__pipe_chunked_write_submit(loop, handle, next);
+      }
+    }
+  } else {
+    assert(handle->write_queue_size >= req->u.io.queued_bytes);
+    handle->write_queue_size -= req->u.io.queued_bytes;
+    /* Ask the kernel how many bytes were actually written.
+     * N.B.: If the write was partially cancelled, this could differ from
+     * queued_bytes. */
+    bytes_written = req->u.io.overlapped.InternalHigh;
+  }
 
   UNREGISTER_HANDLE_REQ(loop, handle, req);
 

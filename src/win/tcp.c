@@ -871,6 +871,134 @@ int uv_tcp_getpeername(const uv_tcp_t* handle,
 }
 
 
+/* Submit the next bounded chunk of a chunked write request to the kernel.
+ * Called for the first chunk from uv__tcp_write / the deferred-write drain,
+ * and for subsequent chunks from uv__process_tcp_write_req. Submission
+ * failures are reported through the completion path. */
+static void uv__tcp_chunked_write_submit(uv_loop_t* loop,
+                                         uv_tcp_t* handle,
+                                         uv_write_t* req) {
+  WSABUF chunk[32];
+  DWORD chunk_count;
+  size_t chunk_bytes;
+  uv_buf_t* buf;
+  int result;
+  DWORD bytes;
+
+  assert(handle->stream.conn.chunked_write == req);
+  assert(req->bufs != NULL);
+  assert(req->write_index < req->nbufs);
+
+  /* Collect whole buffers while they fit under the chunk cap; when the
+   * current buffer is over the cap by itself, submit a bounded slice of it
+   * instead. Either way at least one byte of progress is made per chunk
+   * (except for zero-length buffers, which complete in a single chunk). */
+  chunk_bytes = 0;
+  chunk_count = 0;
+  for (buf = req->bufs + req->write_index;
+       buf < req->bufs + req->nbufs && chunk_count < ARRAY_SIZE(chunk);
+       buf++) {
+    if (buf->len > UV__MAX_WRITE_CHUNK - chunk_bytes)
+      break;
+    chunk[chunk_count].len = buf->len;
+    chunk[chunk_count].buf = buf->base;
+    chunk_bytes += buf->len;
+    chunk_count++;
+  }
+
+  if (chunk_count == 0) {
+    chunk[0].len = UV__MAX_WRITE_CHUNK;
+    chunk[0].buf = req->bufs[req->write_index].base;
+    chunk_count = 1;
+  }
+
+  /* Prepare the overlapped structure for (re)submission. */
+  memset(&req->u.io.overlapped, 0, sizeof(req->u.io.overlapped));
+  if (handle->flags & UV_HANDLE_EMULATE_IOCP)
+    req->u.io.overlapped.hEvent = (HANDLE) ((ULONG_PTR) req->event_handle | 1);
+
+  result = WSASend(handle->socket,
+                   chunk,
+                   chunk_count,
+                   &bytes,
+                   0,
+                   &req->u.io.overlapped,
+                   NULL);
+
+  if (UV_SUCCEEDED_WITHOUT_IOCP(result == 0)) {
+    /* The chunk completed immediately; deliver the completion through the
+     * pending-request queue. The kernel has filled in the overlapped's
+     * Internal/InternalHigh fields. */
+    uv__insert_pending_req(loop, (uv_req_t*) req);
+  } else if (UV_SUCCEEDED_WITH_IOCP(result == 0)) {
+    /* The chunk was queued by the kernel; the completion arrives through
+     * the completion port (or the waited-on event, for emulated IOCP). */
+    if (handle->flags & UV_HANDLE_EMULATE_IOCP &&
+        !RegisterWaitForSingleObject(&req->wait_handle,
+          req->event_handle, post_write_completion, (void*) req,
+          INFINITE, WT_EXECUTEINWAITTHREAD | WT_EXECUTEONLYONCE)) {
+      SET_REQ_ERROR(req, GetLastError());
+      uv__insert_pending_req(loop, (uv_req_t*) req);
+    }
+  } else {
+    /* The submission failed outright; report the error later. Note that the
+     * overlapped was zeroed above, so InternalHigh reports zero bytes. */
+    SET_REQ_ERROR(req, WSAGetLastError());
+    uv__insert_pending_req(loop, (uv_req_t*) req);
+  }
+}
+
+
+/* Route a write request through the bounded-chunk path: keep a copy of the
+ * buffer descriptors (the data itself stays owned by the caller until the
+ * callback, as for any write) and either start submitting chunks or, when
+ * another chunked write is already in progress, park the request behind it
+ * so that data from different requests cannot interleave on the wire. */
+static int uv__tcp_queue_chunked_write(uv_loop_t* loop,
+                                       uv_write_t* req,
+                                       uv_tcp_t* handle,
+                                       const uv_buf_t bufs[],
+                                       unsigned int nbufs,
+                                       size_t total) {
+  req->bufs = req->bufsml;
+  if (nbufs > ARRAY_SIZE(req->bufsml))
+    req->bufs = uv__malloc(nbufs * sizeof(bufs[0]));
+
+  if (req->bufs == NULL) {
+    if (handle->flags & UV_HANDLE_EMULATE_IOCP) {
+      CloseHandle(req->event_handle);
+      req->event_handle = NULL;
+    }
+    return ERROR_NOT_ENOUGH_MEMORY;
+  }
+
+  if (nbufs == 0) {
+    /* Represent an empty write as a single empty buffer. */
+    req->bufs[0] = uv_buf_init(NULL, 0);
+    nbufs = 1;
+  } else {
+    memcpy(req->bufs, bufs, nbufs * sizeof(bufs[0]));
+  }
+  req->nbufs = nbufs;
+  req->write_index = 0;
+  req->u.io.queued_bytes = total;
+
+  handle->reqs_pending++;
+  handle->stream.conn.write_reqs_pending++;
+  REGISTER_HANDLE_REQ(loop, handle, req);
+  handle->write_queue_size += total;
+
+  if (handle->stream.conn.chunked_write != NULL) {
+    uv__stream_defer_write((uv_stream_t*) handle, req);
+  } else {
+    handle->stream.conn.chunked_write = req;
+    uv__tcp_chunked_write_submit(loop, handle, req);
+  }
+
+  return 0;
+}
+
+
 int uv__tcp_write(uv_loop_t* loop,
                  uv_write_t* req,
                  uv_tcp_t* handle,
@@ -879,11 +1007,14 @@ int uv__tcp_write(uv_loop_t* loop,
                  uv_write_cb cb) {
   int result;
   DWORD bytes;
+  size_t total;
 
   UV_REQ_INIT(loop, req, UV_WRITE);
   req->handle = (uv_stream_t*) handle;
   req->cb = cb;
   req->write_extra.nwritten = 0;
+  req->bufs = NULL;
+  req->cancel_requested = 0;
 
   /* Prepare the overlapped structure. */
   memset(&(req->u.io.overlapped), 0, sizeof(req->u.io.overlapped));
@@ -895,6 +1026,16 @@ int uv__tcp_write(uv_loop_t* loop,
     req->u.io.overlapped.hEvent = (HANDLE) ((ULONG_PTR) req->event_handle | 1);
     req->wait_handle = INVALID_HANDLE_VALUE;
   }
+
+  /* Writes larger than UV__MAX_WRITE_CHUNK are fed to the kernel in bounded
+   * chunks: Windows can fail huge overlapped writes with resource errors,
+   * and a single overlapped operation cannot report more than a DWORD of
+   * transferred bytes. While such a write is in progress, every other write
+   * is queued behind it to preserve the stream's byte order. */
+  total = uv__count_bufs(bufs, nbufs);
+  if (total > UV__MAX_WRITE_CHUNK ||
+      handle->stream.conn.chunked_write != NULL)
+    return uv__tcp_queue_chunked_write(loop, req, handle, bufs, nbufs, total);
 
   result = WSASend(handle->socket,
                    (WSABUF*) bufs,
@@ -942,19 +1083,41 @@ int uv__tcp_write(uv_loop_t* loop,
 int uv__tcp_try_write(uv_tcp_t* handle,
                      const uv_buf_t bufs[],
                      unsigned int nbufs) {
+  WSABUF capped;
+  size_t submit_bytes;
+  unsigned int submit_cnt;
   int result;
   DWORD bytes;
 
   if (handle->stream.conn.write_reqs_pending > 0)
     return UV_EAGAIN;
 
-  result = WSASend(handle->socket,
-                   (WSABUF*) bufs,
-                   nbufs,
-                   &bytes,
-                   0,
-                   NULL,
-                   NULL);
+  /* Bound the submission to UV__MAX_WRITE_CHUNK bytes; huge synchronous
+   * sends can fail with resource errors just like huge overlapped ones.
+   * uv_try_write is allowed to return a short count, so submit whole
+   * buffers while they fit under the cap; when the first buffer is over
+   * the cap by itself, submit a bounded slice of it. */
+  submit_bytes = 0;
+  for (submit_cnt = 0; submit_cnt < nbufs; submit_cnt++) {
+    if (bufs[submit_cnt].len > UV__MAX_WRITE_CHUNK - submit_bytes)
+      break;
+    submit_bytes += bufs[submit_cnt].len;
+  }
+
+  if (submit_cnt == 0) {
+    /* Note: nbufs >= 1, so this buffer exists and is too large by itself. */
+    capped.len = UV__MAX_WRITE_CHUNK;
+    capped.buf = bufs[0].base;
+    result = WSASend(handle->socket, &capped, 1, &bytes, 0, NULL, NULL);
+  } else {
+    result = WSASend(handle->socket,
+                     (WSABUF*) bufs,
+                     submit_cnt,
+                     &bytes,
+                     0,
+                     NULL,
+                     NULL);
+  }
 
   if (result == SOCKET_ERROR)
     return uv_translate_sys_error(WSAGetLastError());
@@ -1070,9 +1233,60 @@ void uv__process_tcp_write_req(uv_loop_t* loop, uv_tcp_t* handle,
 
   assert(handle->type == UV_TCP);
 
-  assert(handle->write_queue_size >= req->u.io.queued_bytes);
-  handle->write_queue_size -= req->u.io.queued_bytes;
-  req->write_extra.nwritten += req->u.io.overlapped.InternalHigh;
+  if (req->bufs != NULL) {
+    /* Chunked write: account for the chunk that just completed and, unless
+     * the request is finished (or failed, or was cancelled), submit the next
+     * chunk while keeping the request pending. */
+    int done;
+
+    done = uv__write_req_chunk_update((uv_stream_t*) handle, req,
+                                      req->u.io.overlapped.InternalHigh);
+
+    if (handle->flags & UV_HANDLE_EMULATE_IOCP &&
+        req->wait_handle != INVALID_HANDLE_VALUE) {
+      /* The wait was registered for one completion only; re-registration
+       * happens on the next submission. */
+      UnregisterWait(req->wait_handle);
+      req->wait_handle = INVALID_HANDLE_VALUE;
+    }
+
+    if (REQ_SUCCESS(req) && !done && !req->cancel_requested &&
+        !(handle->flags & UV_HANDLE_CLOSING)) {
+      uv__tcp_chunked_write_submit(loop, handle, req);
+      return;
+    }
+
+    if (REQ_SUCCESS(req) && !done) {
+      /* Cancelled - or overtaken by a close - between chunks. */
+      SET_REQ_ERROR(req, ERROR_OPERATION_ABORTED);
+    }
+
+    /* The request is complete: successfully, in error or cancelled. Release
+     * the unwritten remainder (zero on success); nwritten has already been
+     * accumulated chunk by chunk. If this request was driving the chunk
+     * pipeline, promote the next deferred write. */
+    assert(handle->write_queue_size >= req->u.io.queued_bytes);
+    handle->write_queue_size -= req->u.io.queued_bytes;
+    req->u.io.queued_bytes = 0;
+    uv__write_req_chunk_cleanup(req);
+
+    if (handle->stream.conn.chunked_write == req) {
+      uv_write_t* next;
+
+      handle->stream.conn.chunked_write = NULL;
+      next = uv__stream_deferred_write_dequeue((uv_stream_t*) handle);
+      if (next != NULL) {
+        /* Deferred writes are flushed before the handle starts closing. */
+        assert(!(handle->flags & UV_HANDLE_CLOSING));
+        handle->stream.conn.chunked_write = next;
+        uv__tcp_chunked_write_submit(loop, handle, next);
+      }
+    }
+  } else {
+    assert(handle->write_queue_size >= req->u.io.queued_bytes);
+    handle->write_queue_size -= req->u.io.queued_bytes;
+    req->write_extra.nwritten += req->u.io.overlapped.InternalHigh;
+  }
 
   UNREGISTER_HANDLE_REQ(loop, handle, req);
 
@@ -1403,6 +1617,11 @@ void uv__tcp_close(uv_loop_t* loop, uv_tcp_t* tcp) {
       uv_read_stop((uv_stream_t*) tcp);
     }
     uv__tcp_try_cancel_reqs(tcp);
+    /* Deferred writes have no kernel operation outstanding to cancel;
+     * complete them as cancelled directly. The active chunked write, if
+     * any, stops at its next chunk boundary once UV_HANDLE_CLOSING is
+     * observed by the completion handler. */
+    uv__stream_flush_deferred_writes((uv_stream_t*) tcp);
   } else {
     if (tcp->tcp.serv.accept_reqs != NULL) {
       /* First close the incoming sockets to cancel the accept operations before

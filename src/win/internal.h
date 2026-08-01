@@ -43,6 +43,49 @@ int uv__dup(uv_os_fd_t fd, uv_os_fd_t* dupfd);
 
 
 /*
+ * Streams (shared between TCP and pipes)
+ */
+
+/* The maximum number of bytes to hand to the kernel in a single stream write
+ * submission (one overlapped WriteFile or WSASend). Windows does not document
+ * a limit, but very large submissions fail in practice - the I/O manager has
+ * to probe and lock the entire buffer for the IRP, which can fail with
+ * insufficient-resources errors (e.g. ERROR_NO_SYSTEM_RESOURCES, WSAENOBUFS)
+ * depending on memory pressure and the transport - and a single overlapped
+ * operation cannot report more than a DWORD's worth of transferred bytes
+ * anyway. 0x1ff00000 (511 MB) is the value Julia determined empirically and
+ * has shipped as its own write-splitting limit for many years. Writes larger
+ * than this are submitted in bounded chunks, one kernel operation at a time,
+ * while remaining a single uv_write_t with a single callback. */
+#define UV__MAX_WRITE_CHUNK 0x1ff00000u
+
+/* Wrapper for a write request that owns a heap-allocated copy of the caller's
+ * data (a "coalesced" write, see uv__build_coalesced_write_req). user_req is
+ * the caller-visible request that the write callback must receive. */
+typedef struct {
+  uv_write_t req;       /* Internal heap-allocated write request. */
+  uv_write_t* user_req; /* Pointer to the app's original uv_write_t. */
+} uv__coalesced_write_t;
+
+INLINE static uv_write_t* uv__write_user_req(uv_write_t* req) {
+  if (req->coalesced)
+    return container_of(req, uv__coalesced_write_t, req)->user_req;
+  return req;
+}
+
+/* Chunked-write bookkeeping shared by tcp.c, pipe.c and stream.c. */
+int uv__write_req_chunk_update(uv_stream_t* handle,
+                               uv_write_t* req,
+                               size_t n);
+void uv__write_req_chunk_cleanup(uv_write_t* req);
+void uv__stream_defer_write(uv_stream_t* handle, uv_write_t* req);
+uv_write_t* uv__stream_deferred_write_dequeue(uv_stream_t* handle);
+uv_write_t* uv__stream_deferred_write_remove(uv_stream_t* handle,
+                                             uv_write_t* target);
+void uv__stream_flush_deferred_writes(uv_stream_t* handle);
+
+
+/*
  * TCP
  */
 

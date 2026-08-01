@@ -2195,6 +2195,9 @@ int uv__tty_write(uv_loop_t* loop,
   req->handle = (uv_stream_t*) handle;
   req->cb = cb;
   req->write_extra.nwritten = 0;
+  /* TTY writes complete synchronously and are never chunked. */
+  req->bufs = NULL;
+  req->cancel_requested = 0;
 
   handle->reqs_pending++;
   handle->stream.conn.write_reqs_pending++;

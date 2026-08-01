@@ -38,6 +38,8 @@ INLINE static void uv__stream_init(uv_loop_t* loop,
   handle->activecnt = 0;
   handle->stream.conn.shutdown_req = NULL;
   handle->stream.conn.write_reqs_pending = 0;
+  handle->stream.conn.chunked_write = NULL;
+  handle->stream.conn.deferred_writes_tail = NULL;
 
   UV_REQ_INIT(loop, &handle->read_req, UV_READ);
   handle->read_req.event_handle = NULL;

@@ -192,6 +192,13 @@ API
         The memory pointed to by the buffers must remain valid until the callback gets called.
         This also holds for :c:func:`uv_write2`.
 
+    .. note::
+        A write of any size is a single request with a single callback: when the
+        total size exceeds what the operating system accepts in one kernel
+        submission (about 2 GB on many Unices, less on Windows), libuv submits
+        the data in bounded chunks internally, keeping the request in flight
+        until all data has been written.
+
 .. c:function:: int uv_write2(uv_write_t* req, uv_stream_t* handle, const uv_buf_t bufs[], unsigned int nbufs, uv_stream_t* send_handle, uv_write_cb cb)
 
     Extended write function for sending handles over a pipe. The pipe must be

@@ -272,11 +272,22 @@ struct uv__req_write_extra_s {
     struct uv__req_write_extra_s write_extra;                                 \
   };
 
-#define UV_WRITE_PRIVATE_FIELDS \
-  int coalesced;                \
-  uv_buf_t write_buffer;        \
-  HANDLE event_handle;          \
-  HANDLE wait_handle;
+#define UV_WRITE_PRIVATE_FIELDS                                               \
+  int coalesced;                                                              \
+  uv_buf_t write_buffer;                                                      \
+  HANDLE event_handle;                                                        \
+  HANDLE wait_handle;                                                         \
+  /* Used by writes that are submitted to the kernel in multiple bounded     \
+   * chunks, either because they are larger than UV__MAX_WRITE_CHUNK or      \
+   * because they are queued behind such a write to preserve the stream's    \
+   * byte order. bufs is NULL for ordinary single-submission writes;         \
+   * otherwise it holds the not-yet-submitted portion of the caller's        \
+   * buffers, mirroring the bookkeeping of the Unix implementation. */       \
+  uv_buf_t* bufs;                                                             \
+  unsigned int nbufs;                                                         \
+  unsigned int write_index;                                                   \
+  int cancel_requested;                                                       \
+  uv_buf_t bufsml[1];
 
 #define UV_CONNECT_PRIVATE_FIELDS                                             \
   /* empty */
@@ -311,7 +322,14 @@ struct uv__req_write_extra_s {
 
 #define uv_stream_connection_fields                                           \
   unsigned int write_reqs_pending;                                            \
-  uv_shutdown_t* shutdown_req;
+  uv_shutdown_t* shutdown_req;                                                \
+  /* The write currently being fed to the kernel in bounded chunks, if any.  \
+   * Only used by TCP handles and overlapped pipes; while it is set, new     \
+   * writes are parked on deferred_writes_tail (a circular singly-linked     \
+   * list through next_req) and submitted in order once it completes, so     \
+   * that chunks of different requests cannot interleave on the wire. */     \
+  uv_write_t* chunked_write;                                                  \
+  uv_write_t* deferred_writes_tail;
 
 #define uv_stream_server_fields                                               \
   uv_connection_cb connection_cb;

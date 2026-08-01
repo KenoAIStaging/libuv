@@ -257,8 +257,143 @@ size_t uv_write_nwritten(const uv_write_t* req) {
 }
 
 
+/* Account for `n` more bytes of a chunked write having been accepted by the
+ * kernel, advancing the request's buffer cursor. This mirrors
+ * uv__write_req_update in the Unix implementation. Returns 1 when the
+ * request's buffers are exhausted, 0 when there is more data to submit. */
+int uv__write_req_chunk_update(uv_stream_t* handle,
+                               uv_write_t* req,
+                               size_t n) {
+  uv_buf_t* buf;
+  size_t len;
+
+  assert(req->bufs != NULL);
+  assert(req->write_index < req->nbufs);
+  assert(handle->write_queue_size >= n);
+  assert(req->u.io.queued_bytes >= n);
+
+  handle->write_queue_size -= n;
+  req->u.io.queued_bytes -= n;
+  req->write_extra.nwritten += n;
+
+  buf = req->bufs + req->write_index;
+
+  do {
+    len = n < buf->len ? n : buf->len;
+    buf->base += len;
+    buf->len -= (ULONG) len;
+    buf += (buf->len == 0);  /* Advance to next buffer if this one is empty. */
+    n -= len;
+  } while (n > 0);
+
+  req->write_index = (unsigned int) (buf - req->bufs);
+
+  return req->write_index == req->nbufs;
+}
+
+
+void uv__write_req_chunk_cleanup(uv_write_t* req) {
+  if (req->bufs != NULL) {
+    if (req->bufs != req->bufsml)
+      uv__free(req->bufs);
+    req->bufs = NULL;
+  }
+}
+
+
+/* Writes deferred behind an in-progress chunked write are kept on a circular
+ * singly-linked list (through next_req) whose entry point is the list's tail,
+ * so both head removal and tail insertion are O(1). This matches the layout
+ * of the non-overlapped pipe write queue. */
+void uv__stream_defer_write(uv_stream_t* handle, uv_write_t* req) {
+  uv_write_t* tail;
+
+  assert(handle->stream.conn.chunked_write != NULL);
+
+  tail = handle->stream.conn.deferred_writes_tail;
+  if (tail != NULL) {
+    req->next_req = tail->next_req;
+    tail->next_req = (uv_req_t*) req;
+  } else {
+    req->next_req = (uv_req_t*) req;
+  }
+  handle->stream.conn.deferred_writes_tail = req;
+}
+
+
+/* Remove the element after prev from the deferred write queue. prev must be
+ * a node in the queue. Returns the removed element. */
+static uv_write_t* uv__stream_deferred_write_remove_after(uv_stream_t* handle,
+                                                          uv_write_t* prev) {
+  uv_write_t* req;
+
+  req = (uv_write_t*) prev->next_req;
+  if (req == prev) {
+    /* Only element. */
+    handle->stream.conn.deferred_writes_tail = NULL;
+  } else {
+    prev->next_req = req->next_req;
+    if (req == handle->stream.conn.deferred_writes_tail)
+      handle->stream.conn.deferred_writes_tail = prev;
+  }
+  return req;
+}
+
+
+uv_write_t* uv__stream_deferred_write_dequeue(uv_stream_t* handle) {
+  if (handle->stream.conn.deferred_writes_tail == NULL)
+    return NULL;
+
+  return uv__stream_deferred_write_remove_after(
+      handle, handle->stream.conn.deferred_writes_tail);
+}
+
+
+/* Find and remove a specific request from the deferred write queue. For
+ * coalesced writes, match against the user-facing req. Returns the actual
+ * queued req if found and removed, NULL otherwise. */
+uv_write_t* uv__stream_deferred_write_remove(uv_stream_t* handle,
+                                             uv_write_t* target) {
+  uv_write_t* tail;
+  uv_write_t* prev;
+  uv_write_t* curr;
+
+  tail = handle->stream.conn.deferred_writes_tail;
+  if (tail == NULL)
+    return NULL;
+
+  prev = tail;
+  curr = (uv_write_t*) tail->next_req;
+  do {
+    if (uv__write_user_req(curr) == target)
+      return uv__stream_deferred_write_remove_after(handle, prev);
+
+    prev = curr;
+    curr = (uv_write_t*) curr->next_req;
+  } while (prev != tail);
+
+  return NULL;
+}
+
+
+/* Complete all deferred writes as cancelled. Used when the handle is being
+ * closed; the requests were never submitted to the kernel, so they can be
+ * failed directly through the completion path. */
+void uv__stream_flush_deferred_writes(uv_stream_t* handle) {
+  uv_write_t* req;
+
+  while ((req = uv__stream_deferred_write_dequeue(handle)) != NULL) {
+    SET_REQ_ERROR(req, ERROR_OPERATION_ABORTED);
+    SET_REQ_NWRITTEN(req, 0);
+    uv__insert_pending_req(handle->loop, (uv_req_t*) req);
+  }
+}
+
+
 int uv__write_cancel(uv_write_t* req) {
   uv_stream_t* stream;
+  uv_write_t* queued;
+  uv_write_t* chunked;
   HANDLE handle;
   BOOL result;
 
@@ -283,6 +418,27 @@ int uv__write_cancel(uv_write_t* req) {
       return 0;
     default:
       return UV_EINVAL;
+  }
+
+  /* Writes deferred behind an in-progress chunked write have no kernel
+   * operation outstanding; complete them as cancelled directly. */
+  queued = uv__stream_deferred_write_remove(stream, req);
+  if (queued != NULL) {
+    SET_REQ_ERROR(queued, ERROR_OPERATION_ABORTED);
+    SET_REQ_NWRITTEN(queued, 0);
+    uv__insert_pending_req(stream->loop, (uv_req_t*) queued);
+    return 0;
+  }
+
+  chunked = stream->stream.conn.chunked_write;
+  if (chunked != NULL && uv__write_user_req(chunked) == req) {
+    /* Stop the write at the next chunk boundary, and also try to abort the
+     * chunk that is currently in flight. Even if that chunk completes
+     * successfully before the cancellation lands, the request completes
+     * with UV_ECANCELED - and an accurate uv_write_nwritten() - unless it
+     * was the final chunk, in which case the whole write succeeded. */
+    chunked->cancel_requested = 1;
+    req = chunked; /* CancelIoEx must target the overlapped in actual use. */
   }
 
   result = CancelIoEx(handle, &req->u.io.overlapped);
