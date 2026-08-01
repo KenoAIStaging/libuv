@@ -164,7 +164,7 @@ static uv_write_cb pipe_cancel_cb;
 
 static void pipe_cancel_setup(uv_loop_t* loop) {
   uv_buf_t bufs[4];
-  int fds[2];
+  uv_os_fd_t fds[2];
   int r;
   int i;
 
@@ -386,7 +386,7 @@ static void pipe_write_cb(uv_write_t* req, int status) {
 TEST_IMPL(pipe_write_nwritten) {
   uv_loop_t* loop;
   uv_buf_t buf;
-  int fds[2];
+  uv_os_fd_t fds[2];
 
   loop = uv_default_loop();
 
