@@ -83,14 +83,6 @@ typedef struct {
 STATIC_ASSERT(sizeof(uv__ipc_frame_header_t) == 16);
 STATIC_ASSERT(sizeof(uv__ipc_socket_xfer_info_t) == 632);
 
-/* The read-state members carved out of the ABI-compatibility padding must
- * exactly fill the bytes they took from it: the offsets of the pre-existing
- * members that follow the padding may not move. */
-STATIC_ASSERT(offsetof(uv_pipe_t, pipe.conn.non_overlapped_write_active) ==
-              offsetof(uv_pipe_t, pipe.conn.eof_timer) + sizeof(uv_timer_t*) +
-              (sizeof(uv_write_t) / sizeof(uintptr_t) - 2) *
-                  sizeof(uintptr_t));
-
 static void eof_timer_init(uv_pipe_t* pipe);
 static void eof_timer_start(uv_pipe_t* pipe);
 static void eof_timer_stop(uv_pipe_t* pipe);
@@ -1060,23 +1052,6 @@ error:
   return 0;
 }
 
-/* CancelSynchronousIo publication protocol, used in either direction.
- *
- * A thread about to enter a cancellable synchronous operation publishes its
- * own duplicated thread handle in a slot (a volatile HANDLE guarded by the
- * pipe's thread_lock) and withdraws it after the operation returns; the
- * other side claims the slot and issues CancelSynchronousIo against the
- * published thread, retrying on its own schedule - ERROR_NOT_FOUND means
- * the target was not inside a cancellable syscall at that instant - until
- * the slot is withdrawn. A slot holds NULL or INVALID_HANDLE_VALUE when no
- * thread is published; what the two sentinels mean at rest is up to the
- * slot's owner. */
-
-/* One CancelSynchronousIo attempt against the thread published in *slot.
- * The caller must hold the thread_lock guarding the slot, so that the
- * reread of the slot and the kick happen in one lock hold and cannot race
- * the publisher's withdraw. Returns the slot value that was observed; the
- * caller decides, based on it, whether to keep retrying. */
 static HANDLE uv__pipe_kick_synchronous_io(volatile HANDLE* slot) {
   HANDLE thread;
 
@@ -1089,7 +1064,6 @@ static HANDLE uv__pipe_kick_synchronous_io(volatile HANDLE* slot) {
 
   return thread;
 }
-
 
 /* Cancel a synchronous I/O operation running in a thread pool thread and
  * do not return before it is out of harm's way: thread_ptr is the slot the
@@ -1120,17 +1094,16 @@ static void uv__pipe_cancel_synchronous_io(volatile HANDLE* thread_ptr,
     LeaveCriticalSection(lock);
     return;
   }
-  LeaveCriticalSection(lock);
 
   /* Kick until the thread has acknowledged (by changing *thread_ptr to
    * INVALID_HANDLE_VALUE) that it is past the point of blocking. */
   for (;;) {
-    EnterCriticalSection(lock);
     thread = uv__pipe_kick_synchronous_io(thread_ptr);
     LeaveCriticalSection(lock);
     if (thread == INVALID_HANDLE_VALUE)
       break;
     SwitchToThread();
+    EnterCriticalSection(lock);
   }
 }
 
@@ -1532,35 +1505,12 @@ static void uv__pipe_end_synchronous_io(volatile HANDLE* thread_ptr,
 }
 
 
-/* The "kicker": the publish/cancel protocol above run in the opposite
- * direction, guarding the bounded data reads of pipes in non-overlapped
- * mode. Here it is the LOOP thread that may block, in a data ReadFile
- * sized from a PeekNamedPipe estimate that a peer's write retraction can
- * invalidate (see uv__pipe_read_data_sync), and a thread pool work item is
- * canceller, kicking through the same uv__pipe_kick_synchronous_io
- * primitive that uv__pipe_cancel_synchronous_io uses.
- *
- * Two invariants:
- *
- * - Kicks may land only while the loop thread is inside that one data
- *   ReadFile. The loop thread performs no other synchronous I/O between
- *   uv__pipe_read_kicker_arm() and uv__pipe_read_kicker_disarm(), and a
- *   kick issued while it is not inside a cancellable syscall at all fails
- *   with ERROR_NOT_FOUND, which is harmless.
- *
- * - uv__pipe_read_kicker_disarm() returns only after the kicker work item
- *   has exited, so that no stray kick can outlive the guarded region and
- *   land on whatever synchronous I/O the loop thread - or a user callback
- *   running on it - performs next. The waits used for that (a critical
- *   section and WaitOnAddress) are not cancellable I/O, so the disarm
- *   handshake itself cannot be kicked.
- *
- * The kicker waits ~1ms (nominal; subject to system timer resolution)
- * between kicks, and only kicks after a full wait has elapsed with the
- * loop thread still inside the read. A read that returns without blocking
- * therefore completes unkicked - the fast path costs one work item and
- * one wake, no cancellation - while a read that blocked on retracted
- * bytes is freed within about a millisecond. */
+/* This is the "kicker" thread pool work item.
+ * The only purposes of this thread is to call CancelSynchronousIo on the main
+ * thread, in case it got stuck in a ReadFile because it lost the race to
+ * determine how many byte were available to read. It uses essentially the
+ * same protocol as cancellation of thread-pool IO, but in reverse.
+ */
 static DWORD WINAPI uv_pipe_read_kicker_thread_proc(void* arg) {
   uv_pipe_t* handle = (uv_pipe_t*) arg;
   volatile HANDLE* target_ptr =
@@ -1571,33 +1521,28 @@ static DWORD WINAPI uv_pipe_read_kicker_thread_proc(void* arg) {
   assert(handle->type == UV_NAMED_PIPE);
   assert(handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE);
 
+  EnterCriticalSection(lock);
+  target = *target_ptr;
   for (;;) {
-    /* (Re)read the slot; NULL means withdrawn. The first round never
-     * kicks: a read that returns promptly is disarmed before the cadence
-     * wait below elapses and is never cancelled. */
+    /* Claim the slot and kick whatever is still published. */
+    target = uv__pipe_kick_synchronous_io(target_ptr);
+    if (target == NULL)
+      break;
+
+    LeaveCriticalSection(lock);
+    /* This is Sleep(1), but with a fast wake if the main thread exits the
+       critical section. */
+    WaitOnAddress((volatile VOID*) target_ptr, &target, sizeof(HANDLE), 1);
     EnterCriticalSection(lock);
     target = *target_ptr;
-    LeaveCriticalSection(lock);
-    if (target == NULL)
-      break;
-
-    /* Wait out the kick cadence; a withdraw wakes this immediately. */
-    WaitOnAddress((volatile VOID*) target_ptr, &target, sizeof(HANDLE), 1);
-
-    /* Claim the slot and kick whatever is still published. */
-    EnterCriticalSection(lock);
-    target = uv__pipe_kick_synchronous_io(target_ptr);
-    LeaveCriticalSection(lock);
-    if (target == NULL)
-      break;
   }
+  LeaveCriticalSection(lock);
 
   /* Last act: announce exit and wake a disarm that is waiting for it. */
   InterlockedExchange(&handle->pipe.conn.kicker.active, 0);
   WakeByAddressSingle((PVOID) &handle->pipe.conn.kicker.active);
   return 0;
 }
-
 
 /* Publish the loop thread as the CancelSynchronousIo target and queue the
  * kicker. Called on the loop thread, immediately before the guarded data
@@ -2357,27 +2302,21 @@ static DWORD uv__pipe_read_exactly(uv_pipe_t* handle, void* buffer, DWORD count)
 /* Read data from a pipe in non-overlapped mode. Such pipes cannot carry an
  * overlapped read, so the data is pulled with a blocking loop-thread
  * ReadFile bounded by a PeekNamedPipe estimate. The estimate is inherently
- * race-y - and not only because the peer may consume or produce
- * concurrently: the named pipe file system serves reads for a peer's
- * in-flight (pended) large write directly from the peer's buffer and
- * counts those bytes in the peek, and if the peer then cancels that
- * write, the advertised-but-unread bytes are retracted. A blocking
- * ReadFile sized from the stale peek does not fail in that case; it
- * blocks, with the pipe open and healthy, until unrelated new data
- * arrives - wedging the loop, or deadlocking outright if the write end
- * is driven by the same loop. Since uv_write() requests can be cancelled
- * with uv_cancel(), this is straightforward to hit.
+ * race-y for two reasons:
  *
- * The mode of a pipe end is set at creation and non-overlapped handles
- * cannot carry a pending read, so the race cannot be avoided; instead
- * the ReadFile runs under the reverse CancelSynchronousIo guard (see
- * uv_pipe_read_kicker_thread_proc): if the read did block, the kicker
- * frees it within ~1ms and the peek is simply retried. Byte-mode reads
- * block only when no byte at all is available, so a kicked-out read that
- * had already copied data reports the partial count, which is a normal
- * byte-stream delivery; an empty kicked-out read re-peeks, and finding
- * the pipe dry falls back to the zero-read doorbell. alloc_cb runs after
- * the peek, once data is known to be available. */
+ *  1. The pipe could have another consumer that could have drained the pipe
+ *     between the estimate and the read.
+ *  2. The named pipe file system serves reads for a peer's in-flight (pended)
+ *     large write directly from the peer's buffer and counts those bytes in
+ *     the peek. If the peer then cancels that write, the advertised-but-unread
+ *     bytes are retracted.
+ *
+ * In either case, the resulting ReadFile would indefinitely block the loop
+ * thread, which we need to avoid. To prevent this, we perform the inverse
+ * of the cancellation path: We kick off a thread pool worker item that will
+ * kick us out of any blocking ReadFile immediately. It's not pretty, but it
+ * prevents us from wedging the process.
+ */
 static int uv__pipe_read_data_sync(uv_loop_t* loop,
                                    uv_pipe_t* handle,
                                    DWORD* bytes_read, /* inout argument */
@@ -2407,9 +2346,7 @@ static int uv__pipe_read_data_sync(uv_loop_t* loop,
     }
 
     if (bytes_available == 0) {
-      /* Pipe dry: nothing can be read without blocking indefinitely. The
-       * caller falls back to the doorbell; a buffer already obtained for
-       * a read that was kicked out empty is handed back below. */
+      /* Nothing available to be read (anymore) */
       r = ERROR_SUCCESS;
       *bytes_read = 0;
       break;

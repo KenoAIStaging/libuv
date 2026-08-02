@@ -21,29 +21,8 @@
 
 /* Regression test for the reverse-cancellation "kicker" that guards data
  * reads on Windows pipes in non-overlapped mode.
- *
- * Such pipes are read with a loop-thread ReadFile sized by an immediately
- * preceding PeekNamedPipe. The named pipe file system services reads for a
- * peer's pended (in-flight) large write directly from the peer's buffer and
- * counts those bytes in the peek; when the peer cancels the write, the
- * advertised-but-unread bytes are retracted, and a ReadFile issued in the
- * peek-to-read window then blocks - with the pipe open and healthy - until
- * unrelated new data arrives. Before the kicker existed, that wedged the
- * event loop forever.
- *
- * This test drives the race deterministically: a raw writer thread blocks
- * in a large synchronous WriteFile whose bytes the peek advertises; once
- * the reader has drained a threshold, it parks INSIDE alloc_cb - which
- * libuv calls between the peek and the ReadFile the peek sized - while a
- * canceller thread cancels the writer's WriteFile with CancelSynchronousIo,
- * retracting the advertised bytes. The ReadFile issued when alloc_cb
- * returns then finds the pipe drained mid-window: if it blocks (all
- * remaining advertised bytes were retracted), only the kicker can free it;
- * if the file system retained a residual buffered prefix, the read returns
- * short and the next peek comes up empty. Either way the read cycle must
- * bounce back to the doorbell with the loop live: the repeating timer
- * keeps firing, a write issued after the cancellation is delivered intact,
- * and closing the write end produces a clean EOF. */
+ * See comment before uv__pipe_read_data_sync().
+ */
 
 #include "uv.h"
 #include "task.h"
