@@ -488,9 +488,21 @@ struct uv__req_write_extra_s {
    * when no buffer-carrying read is in flight. Carved out of the ABI        \
    * padding below, whose size shrinks by exactly the bytes taken. */         \
   uv_buf_t read_buf;                                                          \
+  /* Reassembly buffer for the in-progress IPC frame header +                \
+   * socket-transfer record: frame bytes have exactly one landing spot.      \
+   * Lazily allocated. Bytes [0, ipc_frame_got) have arrived; while          \
+   * ipc_frame_got < ipc_frame_want, the one outstanding read lands at       \
+   * ipc_frame_buf + ipc_frame_got instead of in a user buffer.              \
+   * ipc_frame_want is zero when no frame element is being read. Also        \
+   * carved out of the padding below. */                                      \
+  char* ipc_frame_buf;                                                        \
+  uint32_t ipc_frame_got;                                                     \
+  uint32_t ipc_frame_want;                                                    \
   /* TODO: This padding is here for ABI compat - remove in 2.x. */            \
   uintptr_t dummy[sizeof(uv_write_t) / sizeof(uintptr_t) - 2 -                \
-                  sizeof(uv_buf_t) / sizeof(uintptr_t)];                      \
+                  sizeof(uv_buf_t) / sizeof(uintptr_t) -                      \
+                  (sizeof(char*) + 2 * sizeof(uint32_t)) /                    \
+                      sizeof(uintptr_t)];                                     \
   uv_write_t* non_overlapped_write_active;                                    \
   volatile HANDLE writefile_thread_handle;                                    \
   DWORD ipc_remote_pid;                                                       \

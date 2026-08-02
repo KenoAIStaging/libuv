@@ -98,6 +98,11 @@ static void eof_timer_cb(uv_timer_t* timer);
 static void eof_timer_destroy(uv_pipe_t* pipe);
 static void eof_timer_close_cb(uv_handle_t* handle);
 
+/* Size of the buffer that IPC frame headers and socket-transfer records
+ * land in; see uv__pipe_queue_read(). */
+#define UV__IPC_FRAME_BUF_SIZE                                                \
+  (sizeof(uv__ipc_frame_header_t) + sizeof(uv__ipc_socket_xfer_info_t))
+
 
 /* Does the file path contain embedded nul bytes? */
 static int includes_nul(const char *s, size_t n) {
@@ -169,6 +174,9 @@ static void uv__pipe_connection_init(uv_pipe_t* handle) {
   handle->read_req.data = handle;
   handle->pipe.conn.eof_timer = NULL;
   handle->pipe.conn.read_buf = uv_buf_init(NULL, 0);
+  handle->pipe.conn.ipc_frame_buf = NULL;
+  handle->pipe.conn.ipc_frame_got = 0;
+  handle->pipe.conn.ipc_frame_want = 0;
 }
 
 
@@ -728,6 +736,15 @@ void uv__pipe_endgame(uv_loop_t* loop, uv_pipe_t* handle) {
     }
     handle->pipe.conn.ipc_xfer_queue_length = 0;
 
+    /* Freed only now, and not in uv__pipe_close(): a cancelled pending IPC
+     * frame read may still be in flight there, and the kernel writes into
+     * this buffer until that read's completion has drained (reqs_pending
+     * is zero here). */
+    if (handle->pipe.conn.ipc_frame_buf != NULL) {
+      uv__free(handle->pipe.conn.ipc_frame_buf);
+      handle->pipe.conn.ipc_frame_buf = NULL;
+    }
+
     assert(handle->read_req.wait_handle == INVALID_HANDLE_VALUE);
     if (handle->read_req.event_handle != NULL) {
       CloseHandle(handle->read_req.event_handle);
@@ -1121,16 +1138,18 @@ void uv__pipe_interrupt_read(uv_pipe_t* handle) {
 void uv__pipe_read_stop(uv_pipe_t* handle) {
   handle->flags &= ~UV_HANDLE_READING;
   DECREASE_ACTIVE_COUNT(handle->loop, handle);
-  /* For overlapped data pipes, mirror TCP: stopping only stops delivery, it
+  /* For overlapped pipes, mirror TCP: stopping only stops delivery, it
    * does not cancel. The posted read stays pending, together with the
-   * buffer it reads into, and is delivered to whichever read_cb is current
-   * when it completes - even if reading is stopped by then; uv_read_start()
-   * will not post a second read while one is pending. Only closing the
+   * buffer it reads into (an alloc_cb buffer, or the handle's IPC frame
+   * buffer), and completes into whichever read_cb is current at completion
+   * time - even if reading is stopped by then; uv_read_start() will not
+   * post a second read while one is pending, and IPC frame reads resume
+   * into the same frame buffer across a stop/start. Only closing the
    * handle cancels the read (through uv__pipe_interrupt_read()).
    *
-   * The zero-read used by IPC pipes and by pipes in non-overlapped mode is
+   * The zero-read doorbell used by pipes in non-overlapped mode is
    * bufferless, so for those stopping cancels it, as it always has. */
-  if (handle->ipc || (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE))
+  if (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE)
     uv__pipe_interrupt_read(handle);
 }
 
@@ -1639,12 +1658,36 @@ static void uv__pipe_queue_read(uv_loop_t* loop, uv_pipe_t* handle) {
       goto error;
     }
   } else {
-    if (handle->ipc) {
-      /* The IPC frame reader still pulls its bytes off the pipe
-       * synchronously (see uv__pipe_read_ipc) and is woken up by a
-       * zero-length read that completes when data is available. TODO: fold
-       * IPC pipes into the one-pending-read scheme below. */
-      buf = uv_buf_init(uv_zero_, 0);
+    if (handle->ipc &&
+        (handle->pipe.conn.ipc_frame_want > 0 ||
+         handle->pipe.conn.ipc_data_frame.payload_remaining == 0)) {
+      /* The next bytes on the pipe belong to an IPC frame header, or to
+       * the socket-transfer record announced by one: land them in the
+       * handle's frame buffer. Frame bytes have exactly one landing spot,
+       * and an incomplete frame element simply stays a pending read until
+       * the rest of it arrives or the pipe dies. IPC pipes are always
+       * overlapped on Windows. */
+      assert(handle->pipe.conn.read_buf.base == NULL);
+      if (handle->pipe.conn.ipc_frame_buf == NULL) {
+        handle->pipe.conn.ipc_frame_buf =
+            (char*) uv__malloc(UV__IPC_FRAME_BUF_SIZE);
+        if (handle->pipe.conn.ipc_frame_buf == NULL)
+          uv_fatal_error(ERROR_OUTOFMEMORY, "uv__malloc");
+      }
+      if (handle->pipe.conn.ipc_frame_want == 0) {
+        /* Start of a new frame: read its header. */
+        handle->pipe.conn.ipc_frame_got = 0;
+        handle->pipe.conn.ipc_frame_want =
+            sizeof(uv__ipc_frame_header_t);
+      }
+      assert(handle->pipe.conn.ipc_frame_got <
+             handle->pipe.conn.ipc_frame_want);
+      assert(handle->pipe.conn.ipc_frame_want <=
+             UV__IPC_FRAME_BUF_SIZE);
+      buf = uv_buf_init(handle->pipe.conn.ipc_frame_buf +
+                            handle->pipe.conn.ipc_frame_got,
+                        handle->pipe.conn.ipc_frame_want -
+                            handle->pipe.conn.ipc_frame_got);
     } else {
       /* Read like a socket: post one read into a caller-allocated buffer
        * and let it stay pending until data arrives. Byte-mode pipe reads
@@ -1665,6 +1708,14 @@ static void uv__pipe_queue_read(uv_loop_t* loop, uv_pipe_t* handle) {
       }
       if (buf.len > UV__IO_MAX_BYTES)
         buf.len = UV__IO_MAX_BYTES;
+      if (handle->ipc) {
+        /* This read carries IPC frame payload. Bound it by the announced
+         * payload length: the bytes after the payload belong to the next
+         * frame's header, which must never land in a user buffer. */
+        assert(handle->pipe.conn.ipc_data_frame.payload_remaining > 0);
+        if (buf.len > handle->pipe.conn.ipc_data_frame.payload_remaining)
+          buf.len = handle->pipe.conn.ipc_data_frame.payload_remaining;
+      }
       handle->pipe.conn.read_buf = buf;
     }
 
@@ -2160,38 +2211,6 @@ static void uv__pipe_queue_ipc_xfer_info(
 }
 
 
-/* Read an exact number of bytes from a pipe. If an error or end-of-file is
- * encountered before the requested number of bytes are read, an error is
- * returned. */
-static DWORD uv__pipe_read_exactly(uv_pipe_t* handle, void* buffer, DWORD count) {
-  uv_read_t* req;
-  DWORD bytes_read;
-  DWORD bytes_read_now;
-
-  bytes_read = 0;
-  while (bytes_read < count) {
-    req = &handle->read_req;
-    memset(&req->u.io.overlapped, 0, sizeof(req->u.io.overlapped));
-    req->u.io.overlapped.hEvent = (HANDLE) ((uintptr_t) req->event_handle | 1);
-    if (!ReadFile(handle->handle,
-                  (char*) buffer + bytes_read,
-                  count - bytes_read,
-                  &bytes_read_now,
-                  &req->u.io.overlapped)) {
-      if (GetLastError() != ERROR_IO_PENDING)
-        return GetLastError();
-      if (!GetOverlappedResult(handle->handle, &req->u.io.overlapped, &bytes_read_now, TRUE))
-        return GetLastError();
-    }
-
-    bytes_read += bytes_read_now;
-  }
-
-  assert(bytes_read == count);
-  return 0;
-}
-
-
 /* Read data from a pipe in non-overlapped mode. Such pipes cannot carry an
  * overlapped read, so the data is pulled with a blocking loop-thread
  * ReadFile bounded by a PeekNamedPipe estimate. */
@@ -2252,96 +2271,31 @@ static int uv__pipe_read_data_sync(uv_loop_t* loop,
 }
 
 
-static int uv__pipe_read_data(uv_loop_t* loop,
-                              uv_pipe_t* handle,
-                              DWORD* bytes_read, /* inout argument */
-                              DWORD max_bytes) {
-  uv_buf_t buf;
-  uv_read_t* req;
-  DWORD r;
-  int more;
+/* Parse a completely received IPC frame element out of the frame buffer:
+ * either the frame header, or the socket-transfer record that follows it.
+ * Completing the header either extends the expected byte count so that the
+ * following reads land the socket-transfer record in the frame buffer
+ * behind it, or completes the frame; a frame that announces payload leaves
+ * payload_remaining nonzero, directing uv__pipe_queue_read() to post the
+ * next reads into user buffers. */
+static void uv__pipe_parse_ipc_frame(uv_loop_t* loop, uv_pipe_t* handle) {
+  uv__ipc_frame_header_t frame_header;
+  uint32_t xfer_flags;
+  uv__ipc_socket_xfer_type_t xfer_type;
+  char* buf;
 
-  if (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE)
-    return uv__pipe_read_data_sync(loop, handle, bytes_read, max_bytes);
+  buf = handle->pipe.conn.ipc_frame_buf;
+  assert(buf != NULL);
+  assert(handle->pipe.conn.ipc_frame_want > 0);
+  assert(handle->pipe.conn.ipc_frame_got ==
+         handle->pipe.conn.ipc_frame_want);
 
-  /* Ask the user for a buffer to read data into. */
-  buf = uv_buf_init(NULL, 0);
-  handle->alloc_cb((uv_handle_t*) handle, *bytes_read, &buf);
-  if (buf.base == NULL || buf.len == 0) {
-    handle->read_cb((uv_stream_t*) handle, UV_ENOBUFS, &buf);
-    return 0; /* Break out of read loop. */
-  }
+  /* The header always sits at the start of the frame buffer. */
+  memcpy(&frame_header, buf, sizeof frame_header);
 
-  /* Ensure we read at most the smaller of:
-   *   (a) the length of the user-allocated buffer.
-   *   (b) the maximum data length as specified by the `max_bytes` argument.
-   *   (c) UV__IO_MAX_BYTES.
-   */
-  if (buf.len > UV__IO_MAX_BYTES)
-    buf.len = UV__IO_MAX_BYTES;
-  if (max_bytes > buf.len)
-    max_bytes = buf.len;
-
-  /* Read into the user buffer.
-   * Prepare an Event so that we can cancel if it doesn't complete immediately.
-   */
-  req = &handle->read_req;
-  memset(&req->u.io.overlapped, 0, sizeof(req->u.io.overlapped));
-  req->u.io.overlapped.hEvent = (HANDLE) ((uintptr_t) req->event_handle | 1);
-  if (ReadFile(handle->handle, buf.base, max_bytes, bytes_read, &req->u.io.overlapped)) {
-    r = ERROR_SUCCESS;
-  } else {
-    r = GetLastError();
-    *bytes_read = 0;
-    if (r == ERROR_IO_PENDING) {
-      r = CancelIoEx(handle->handle, &req->u.io.overlapped);
-      assert(r || GetLastError() == ERROR_NOT_FOUND);
-      if (GetOverlappedResult(handle->handle, &req->u.io.overlapped, bytes_read, TRUE)) {
-        r = ERROR_SUCCESS;
-      } else {
-        r = GetLastError();
-        *bytes_read = 0;
-      }
-    }
-  }
-  more = *bytes_read == max_bytes;
-
-  /* Call the read callback. */
-  if (r == ERROR_SUCCESS || r == ERROR_OPERATION_ABORTED)
-    handle->read_cb((uv_stream_t*) handle, *bytes_read, &buf);
-  else
-    uv__pipe_read_error_or_eof(loop, handle, r, buf);
-
-  return more;
-}
-
-
-static int uv__pipe_read_ipc(uv_loop_t* loop, uv_pipe_t* handle) {
-  uint32_t* data_remaining;
-  DWORD err;
-  DWORD more;
-  DWORD bytes_read;
-
-  data_remaining = &handle->pipe.conn.ipc_data_frame.payload_remaining;
-
-  if (*data_remaining > 0) {
-    /* Read frame data payload. */
-    bytes_read = *data_remaining;
-    more = uv__pipe_read_data(loop, handle, &bytes_read, bytes_read);
-    *data_remaining -= bytes_read;
-
-  } else {
-    /* Start of a new IPC frame. */
-    uv__ipc_frame_header_t frame_header;
-    uint32_t xfer_flags;
-    uv__ipc_socket_xfer_type_t xfer_type;
-    uv__ipc_socket_xfer_info_t xfer_info;
-
-    /* Read the IPC frame header. */
-    err = uv__pipe_read_exactly(
-        handle, &frame_header, sizeof frame_header);
-    if (err)
-      goto error;
+  if (handle->pipe.conn.ipc_frame_want == sizeof frame_header) {
+    /* Frame header complete; validate and parse it. */
+    assert(handle->pipe.conn.ipc_data_frame.payload_remaining == 0);
 
     /* Validate that flags are valid. */
     if ((frame_header.flags & ~UV__IPC_FRAME_VALID_FLAGS) != 0)
@@ -2353,53 +2307,56 @@ static int uv__pipe_read_ipc(uv_loop_t* loop, uv_pipe_t* handle) {
     /* Parse xfer flags. */
     xfer_flags = frame_header.flags & UV__IPC_FRAME_XFER_FLAGS;
     if (xfer_flags & UV__IPC_FRAME_HAS_SOCKET_XFER) {
-      /* Socket coming -- determine the type. */
-      xfer_type = xfer_flags & UV__IPC_FRAME_XFER_IS_TCP_CONNECTION
-                      ? UV__IPC_SOCKET_XFER_TCP_CONNECTION
-                      : UV__IPC_SOCKET_XFER_TCP_SERVER;
-    } else if (xfer_flags == 0) {
-      /* No socket. */
-      xfer_type = UV__IPC_SOCKET_XFER_NONE;
-    } else {
+      /* Socket coming - the record that follows the header lands in the
+       * frame buffer right behind it. */
+      handle->pipe.conn.ipc_frame_want = UV__IPC_FRAME_BUF_SIZE;
+    } else if (xfer_flags != 0) {
       /* Invalid flags. */
       goto invalid;
     }
 
     /* Parse data frame information. */
     if (frame_header.flags & UV__IPC_FRAME_HAS_DATA) {
-      *data_remaining = frame_header.data_length;
+      handle->pipe.conn.ipc_data_frame.payload_remaining =
+          frame_header.data_length;
     } else if (frame_header.data_length != 0) {
       /* Data length greater than zero but data flag not set -- invalid. */
       goto invalid;
     }
 
-    /* If no socket xfer info follows, return here. Data will be read in a
-     * subsequent invocation of uv__pipe_read_ipc(). */
-    if (xfer_type != UV__IPC_SOCKET_XFER_NONE) {
-      /* Read transferred socket information. */
-      err = uv__pipe_read_exactly(handle, &xfer_info, sizeof xfer_info);
-      if (err)
-        goto error;
+    if (handle->pipe.conn.ipc_frame_want >
+        handle->pipe.conn.ipc_frame_got)
+      return; /* Now wait for the socket-transfer record. */
+  } else {
+    /* Socket-transfer record complete. Recompute the xfer type from the
+     * header, which still sits at the start of the frame buffer (it was
+     * validated when it completed). */
+    assert(handle->pipe.conn.ipc_frame_want ==
+           UV__IPC_FRAME_BUF_SIZE);
+    xfer_flags = frame_header.flags & UV__IPC_FRAME_XFER_FLAGS;
+    assert(xfer_flags & UV__IPC_FRAME_HAS_SOCKET_XFER);
+    xfer_type = xfer_flags & UV__IPC_FRAME_XFER_IS_TCP_CONNECTION
+                    ? UV__IPC_SOCKET_XFER_TCP_CONNECTION
+                    : UV__IPC_SOCKET_XFER_TCP_SERVER;
 
-      /* Store the pending socket info. */
-      uv__pipe_queue_ipc_xfer_info(handle, xfer_type, &xfer_info);
-    }
+    /* Store the pending socket info. */
+    uv__pipe_queue_ipc_xfer_info(
+        handle,
+        xfer_type,
+        (uv__ipc_socket_xfer_info_t*) (buf + sizeof frame_header));
   }
 
-  /* Return whether the caller should immediately try another read call to get
-   * more data. Calling uv__pipe_read_exactly will hang if there isn't data
-   * available, so we cannot do this unless we are guaranteed not to reach that.
-   */
-  more = *data_remaining > 0;
-  return more;
+  /* Frame complete. Payload, if any, is read into user buffers by the
+   * reads that uv__pipe_queue_read() posts next. */
+  handle->pipe.conn.ipc_frame_got = 0;
+  handle->pipe.conn.ipc_frame_want = 0;
+  return;
 
 invalid:
   /* Invalid frame. */
-  err = WSAECONNABORTED; /* Maps to UV_ECONNABORTED. */
-
-error:
-  uv__pipe_read_error_or_eof(loop, handle, err, uv_null_buf_);
-  return 0; /* Break out of read loop. */
+  handle->pipe.conn.ipc_frame_got = 0;
+  handle->pipe.conn.ipc_frame_want = 0;
+  uv__pipe_read_error_or_eof(loop, handle, WSAECONNABORTED, uv_null_buf_);
 }
 
 
@@ -2422,9 +2379,10 @@ void uv__process_pipe_read_req(uv_loop_t* loop,
     handle->read_req.wait_handle = INVALID_HANDLE_VALUE;
   }
 
-  if (handle->ipc || (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE)) {
-    /* Legacy zero-read + pull scheme, still used for IPC pipes and for
-     * pipes in non-overlapped mode. */
+  if (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE) {
+    /* Zero-read doorbell + pull scheme, used by pipes in non-overlapped
+     * mode. */
+    assert(!handle->ipc);
 
     /* At this point, we're done with bookkeeping. If the user has stopped
      * reading the pipe in the meantime, there is nothing left to do, since
@@ -2449,12 +2407,10 @@ void uv__process_pipe_read_req(uv_loop_t* loop,
       while (handle->flags & UV_HANDLE_READING &&
              !(handle->flags & UV_HANDLE_READ_PENDING)) {
         bytes_requested = 65536;
-        /* Depending on the type of pipe, read either IPC frames or raw
-         * data. */
-        if (handle->ipc)
-          more = uv__pipe_read_ipc(loop, handle);
-        else
-          more = uv__pipe_read_data(loop, handle, &bytes_requested, INT32_MAX);
+        more = uv__pipe_read_data_sync(loop,
+                                        handle,
+                                        &bytes_requested,
+                                        INT32_MAX);
 
         /* If no bytes were read, treat this as an indication that an error
          * occurred, and break out of the read loop. */
@@ -2464,6 +2420,50 @@ void uv__process_pipe_read_req(uv_loop_t* loop,
     }
 
     /* Start another zero-read request if necessary. */
+    if ((handle->flags & UV_HANDLE_READING) &&
+        !(handle->flags & UV_HANDLE_READ_PENDING)) {
+      uv__pipe_queue_read(loop, handle);
+    }
+    return;
+  }
+
+  if (handle->ipc && handle->pipe.conn.ipc_frame_want > 0) {
+    /* The pending read was landing IPC frame bytes (a frame header or the
+     * socket-transfer record following one) in the handle's frame buffer.
+     * No user buffer is involved and nothing is delivered to the
+     * application here; the frame state machine advances and the next read
+     * is posted. */
+    if (handle->flags & UV_HANDLE_CLOSING) {
+      /* The read was cancelled by uv__pipe_close(). The partial frame is
+       * discarded with the handle; the frame buffer is freed in
+       * uv__pipe_endgame() once this completion has drained. */
+      return;
+    }
+
+    if (!REQ_SUCCESS(req) &&
+        GET_REQ_ERROR(req) != ERROR_OPERATION_ABORTED) {
+      /* An error occurred doing the frame read; a broken pipe maps to EOF.
+       * A frame that stops short of completion because the peer died is
+       * reported here through the ordinary error path. */
+      uv__pipe_read_error_or_eof(loop, handle, GET_REQ_ERROR(req),
+                                 uv_null_buf_);
+    } else {
+      /* Success - or a cancellation by uv__pipe_getname()'s
+       * uv__pipe_interrupt_read(), which is not a user-visible event: the
+       * frame simply resumes with the next posted read. Bytes that landed
+       * in the frame buffer are accounted for in either case; consumed
+       * bytes are never dropped. */
+      handle->pipe.conn.ipc_frame_got +=
+          (uint32_t) req->u.io.overlapped.InternalHigh;
+      assert(handle->pipe.conn.ipc_frame_got <=
+             handle->pipe.conn.ipc_frame_want);
+      if (handle->pipe.conn.ipc_frame_got ==
+          handle->pipe.conn.ipc_frame_want)
+        uv__pipe_parse_ipc_frame(loop, handle);
+    }
+
+    /* Post the next read (frame remainder, next frame's header, or frame
+     * payload into a user buffer, as appropriate) if still reading. */
     if ((handle->flags & UV_HANDLE_READING) &&
         !(handle->flags & UV_HANDLE_READ_PENDING)) {
       uv__pipe_queue_read(loop, handle);
@@ -2495,6 +2495,12 @@ void uv__process_pipe_read_req(uv_loop_t* loop,
      * NtQueryInformationFile) before it copied any data. Nothing the
      * application needs to see; post the next read below. */
   } else if (err == ERROR_SUCCESS || err == ERROR_OPERATION_ABORTED) {
+    if (handle->ipc) {
+      /* This read carried IPC frame payload (uv__pipe_queue_read() bounded
+       * it by the announced payload length). */
+      assert(bytes <= handle->pipe.conn.ipc_data_frame.payload_remaining);
+      handle->pipe.conn.ipc_data_frame.payload_remaining -= bytes;
+    }
     /* Deliver the data, TCP-style: even if the application stopped reading
      * while the read was pending, the bytes were consumed from the pipe on
      * its behalf and land in a buffer the application handed us, so read_cb
