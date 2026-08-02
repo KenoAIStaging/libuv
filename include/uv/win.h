@@ -482,8 +482,15 @@ struct uv__req_write_extra_s {
 
 #define uv_pipe_connection_fields                                             \
   uv_timer_t* eof_timer;                                                      \
-  /* TODO: This is here for ABI compat - remove in 2.x. */                    \
-  uintptr_t dummy[sizeof(uv_write_t) / sizeof(uintptr_t) - 2];                \
+  /* Buffer that the one outstanding read on an overlapped pipe delivers     \
+   * into. Requested from alloc_cb when the read is posted and pinned until  \
+   * the read completes, like a pending TCP recv's buffer. base is NULL      \
+   * when no buffer-carrying read is in flight. Carved out of the ABI        \
+   * padding below, whose size shrinks by exactly the bytes taken. */         \
+  uv_buf_t read_buf;                                                          \
+  /* TODO: This padding is here for ABI compat - remove in 2.x. */            \
+  uintptr_t dummy[sizeof(uv_write_t) / sizeof(uintptr_t) - 2 -                \
+                  sizeof(uv_buf_t) / sizeof(uintptr_t)];                      \
   uv_write_t* non_overlapped_write_active;                                    \
   volatile HANDLE writefile_thread_handle;                                    \
   DWORD ipc_remote_pid;                                                       \

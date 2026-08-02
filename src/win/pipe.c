@@ -83,6 +83,14 @@ typedef struct {
 STATIC_ASSERT(sizeof(uv__ipc_frame_header_t) == 16);
 STATIC_ASSERT(sizeof(uv__ipc_socket_xfer_info_t) == 632);
 
+/* The read-state members carved out of the ABI-compatibility padding must
+ * exactly fill the bytes they took from it: the offsets of the pre-existing
+ * members that follow the padding may not move. */
+STATIC_ASSERT(offsetof(uv_pipe_t, pipe.conn.non_overlapped_write_active) ==
+              offsetof(uv_pipe_t, pipe.conn.eof_timer) + sizeof(uv_timer_t*) +
+              (sizeof(uv_write_t) / sizeof(uintptr_t) - 2) *
+                  sizeof(uintptr_t));
+
 static void eof_timer_init(uv_pipe_t* pipe);
 static void eof_timer_start(uv_pipe_t* pipe);
 static void eof_timer_stop(uv_pipe_t* pipe);
@@ -160,6 +168,7 @@ static void uv__pipe_connection_init(uv_pipe_t* handle) {
   uv__connection_init((uv_stream_t*) handle);
   handle->read_req.data = handle;
   handle->pipe.conn.eof_timer = NULL;
+  handle->pipe.conn.read_buf = uv_buf_init(NULL, 0);
 }
 
 
@@ -1112,7 +1121,17 @@ void uv__pipe_interrupt_read(uv_pipe_t* handle) {
 void uv__pipe_read_stop(uv_pipe_t* handle) {
   handle->flags &= ~UV_HANDLE_READING;
   DECREASE_ACTIVE_COUNT(handle->loop, handle);
-  uv__pipe_interrupt_read(handle);
+  /* For overlapped data pipes, mirror TCP: stopping only stops delivery, it
+   * does not cancel. The posted read stays pending, together with the
+   * buffer it reads into, and is delivered to whichever read_cb is current
+   * when it completes - even if reading is stopped by then; uv_read_start()
+   * will not post a second read while one is pending. Only closing the
+   * handle cancels the read (through uv__pipe_interrupt_read()).
+   *
+   * The zero-read used by IPC pipes and by pipes in non-overlapped mode is
+   * bufferless, so for those stopping cancels it, as it always has. */
+  if (handle->ipc || (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE))
+    uv__pipe_interrupt_read(handle);
 }
 
 
@@ -1601,6 +1620,7 @@ static void CALLBACK post_completion_write_wait(void* context, BOOLEAN timed_out
 
 static void uv__pipe_queue_read(uv_loop_t* loop, uv_pipe_t* handle) {
   uv_read_t* req;
+  uv_buf_t buf;
   int result;
 
   assert(handle->flags & UV_HANDLE_READING);
@@ -1619,16 +1639,45 @@ static void uv__pipe_queue_read(uv_loop_t* loop, uv_pipe_t* handle) {
       goto error;
     }
   } else {
+    if (handle->ipc) {
+      /* The IPC frame reader still pulls its bytes off the pipe
+       * synchronously (see uv__pipe_read_ipc) and is woken up by a
+       * zero-length read that completes when data is available. TODO: fold
+       * IPC pipes into the one-pending-read scheme below. */
+      buf = uv_buf_init(uv_zero_, 0);
+    } else {
+      /* Read like a socket: post one read into a caller-allocated buffer
+       * and let it stay pending until data arrives. Byte-mode pipe reads
+       * complete with min(requested, available) as soon as at least one
+       * byte can be read, so a bounded read never waits for its full size.
+       * If a peer retracts bytes it had advertised - the named pipe file
+       * system services reads for a peer's in-flight (pended) large write
+       * directly from the peer's buffer, and a cancelled write takes the
+       * unread bytes with it - the posted read simply remains pending
+       * until the next write arrives or the pipe dies, with the loop live.
+       * No PeekNamedPipe sizing is involved anywhere (the peeked count was
+       * only ever a hint) and no zero-read doorbell is needed. */
+      buf = uv_buf_init(NULL, 0);
+      handle->alloc_cb((uv_handle_t*) handle, 65536, &buf);
+      if (buf.base == NULL || buf.len == 0) {
+        handle->read_cb((uv_stream_t*) handle, UV_ENOBUFS, &buf);
+        return;
+      }
+      if (buf.len > UV__IO_MAX_BYTES)
+        buf.len = UV__IO_MAX_BYTES;
+      handle->pipe.conn.read_buf = buf;
+    }
+
     memset(&req->u.io.overlapped, 0, sizeof(req->u.io.overlapped));
     if (handle->flags & UV_HANDLE_EMULATE_IOCP) {
       assert(req->event_handle != NULL);
-      req->u.io.overlapped.hEvent = (HANDLE) ((uintptr_t) req->event_handle | 1);
+      req->u.io.overlapped.hEvent =
+          (HANDLE) ((uintptr_t) req->event_handle | 1);
     }
 
-    /* Do 0-read */
     result = ReadFile(handle->handle,
-                      &uv_zero_,
-                      0,
+                      buf.base,
+                      buf.len,
                       NULL,
                       &req->u.io.overlapped);
 
@@ -2359,7 +2408,9 @@ void uv__process_pipe_read_req(uv_loop_t* loop,
                                uv_req_t* req) {
   DWORD err;
   DWORD more;
+  DWORD bytes;
   DWORD bytes_requested;
+  uv_buf_t buf;
   assert(handle->type == UV_NAMED_PIPE);
 
   handle->flags &= ~(UV_HANDLE_READ_PENDING | UV_HANDLE_READ_CANCELLATION_PENDING);
@@ -2371,42 +2422,95 @@ void uv__process_pipe_read_req(uv_loop_t* loop,
     handle->read_req.wait_handle = INVALID_HANDLE_VALUE;
   }
 
-  /* At this point, we're done with bookkeeping. If the user has stopped
-   * reading the pipe in the meantime, there is nothing left to do, since there
-   * is no callback that we can call. */
-  if (!(handle->flags & UV_HANDLE_READING))
-    return;
+  if (handle->ipc || (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE)) {
+    /* Legacy zero-read + pull scheme, still used for IPC pipes and for
+     * pipes in non-overlapped mode. */
 
-  if (!REQ_SUCCESS(req)) {
-    /* An error occurred doing the zero-read. */
-    err = GET_REQ_ERROR(req);
+    /* At this point, we're done with bookkeeping. If the user has stopped
+     * reading the pipe in the meantime, there is nothing left to do, since
+     * there is no data to hand back. */
+    if (!(handle->flags & UV_HANDLE_READING))
+      return;
 
-    /* If the read was cancelled by uv__pipe_interrupt_read(), the request may
-     * indicate an ERROR_OPERATION_ABORTED error. This error isn't relevant to
-     * the user; we'll start a new zero-read at the end of this function. */
-    if (err != ERROR_OPERATION_ABORTED)
-      uv__pipe_read_error_or_eof(loop, handle, err, uv_null_buf_);
+    if (!REQ_SUCCESS(req)) {
+      /* An error occurred doing the zero-read. */
+      err = GET_REQ_ERROR(req);
 
-  } else {
-    /* The zero-read completed without error, indicating there is data
-     * available in the kernel buffer. */
-    while (handle->flags & UV_HANDLE_READING &&
-           !(handle->flags & UV_HANDLE_READ_PENDING)) {
-      bytes_requested = 65536;
-      /* Depending on the type of pipe, read either IPC frames or raw data. */
-      if (handle->ipc)
+      /* If the read was cancelled by uv__pipe_interrupt_read(), the request
+       * may indicate an ERROR_OPERATION_ABORTED error. This error isn't
+       * relevant to the user; we'll start a new zero-read at the end of this
+       * function. */
+      if (err != ERROR_OPERATION_ABORTED)
+        uv__pipe_read_error_or_eof(loop, handle, err, uv_null_buf_);
+
+    } else {
+      /* The zero-read completed without error, indicating there is data
+       * available in the kernel buffer. */
+      while (handle->flags & UV_HANDLE_READING &&
+             !(handle->flags & UV_HANDLE_READ_PENDING)) {
+        bytes_requested = 65536;
+        /* Depending on the type of pipe, read either IPC frames or raw
+         * data. */
+        if (handle->ipc)
           more = uv__pipe_read_ipc(loop, handle);
-      else
+        else
           more = uv__pipe_read_data(loop, handle, &bytes_requested, INT32_MAX);
 
-      /* If no bytes were read, treat this as an indication that an error
-       * occurred, and break out of the read loop. */
-      if (more == 0)
-        break;
+        /* If no bytes were read, treat this as an indication that an error
+         * occurred, and break out of the read loop. */
+        if (more == 0)
+          break;
+      }
     }
+
+    /* Start another zero-read request if necessary. */
+    if ((handle->flags & UV_HANDLE_READING) &&
+        !(handle->flags & UV_HANDLE_READ_PENDING)) {
+      uv__pipe_queue_read(loop, handle);
+    }
+    return;
   }
 
-  /* Start another zero-read request if necessary. */
+  /* The one pending read into a real buffer completed (see
+   * uv__pipe_queue_read). Take the buffer out of the handle first, so that
+   * the handle state is consistent however the completion is handled. */
+  buf = handle->pipe.conn.read_buf;
+  handle->pipe.conn.read_buf = uv_buf_init(NULL, 0);
+  assert(buf.base != NULL);
+
+  if (handle->flags & UV_HANDLE_CLOSING) {
+    /* The read was cancelled by uv__pipe_close() and the handle is going
+     * away: read_cb must not be entered anymore, so there is no way to hand
+     * the buffer back. Bytes that the cancelled read may still have copied
+     * are discarded with the handle, like the undelivered kernel buffer
+     * contents of a closed TCP socket. */
+    return;
+  }
+
+  err = REQ_SUCCESS(req) ? ERROR_SUCCESS : GET_REQ_ERROR(req);
+  bytes = (DWORD) req->u.io.overlapped.InternalHigh;
+
+  if (err == ERROR_OPERATION_ABORTED && bytes == 0) {
+    /* The read was cancelled (uv__pipe_getname() interrupts reads around
+     * NtQueryInformationFile) before it copied any data. Nothing the
+     * application needs to see; post the next read below. */
+  } else if (err == ERROR_SUCCESS || err == ERROR_OPERATION_ABORTED) {
+    /* Deliver the data, TCP-style: even if the application stopped reading
+     * while the read was pending, the bytes were consumed from the pipe on
+     * its behalf and land in a buffer the application handed us, so read_cb
+     * - which must stay valid while a read is pending - is called with them
+     * now. A cancelled read that already copied bytes delivers the partial
+     * count; consumed bytes are never dropped. */
+    handle->read_cb((uv_stream_t*) handle, bytes, &buf);
+  } else {
+    /* Error, or EOF (ERROR_BROKEN_PIPE) - hand the buffer back through the
+     * callback along with the verdict. */
+    uv__pipe_read_error_or_eof(loop, handle, err, buf);
+  }
+
+  /* Post the next read if still reading and the callback did not already
+   * (uv_read_start() from inside the callback posts one when no read is
+   * pending). */
   if ((handle->flags & UV_HANDLE_READING) &&
       !(handle->flags & UV_HANDLE_READ_PENDING)) {
     uv__pipe_queue_read(loop, handle);
