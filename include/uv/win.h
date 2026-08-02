@@ -480,10 +480,31 @@ struct uv__req_write_extra_s {
   uv_pipe_accept_t* accept_reqs;                                              \
   uv_pipe_accept_t* pending_accepts;
 
+/* Reverse-direction CancelSynchronousIo state ("kicker") for the bounded
+ * data reads of pipes in non-overlapped mode. While the loop thread is
+ * inside a data ReadFile that may have raced a peer's write retraction, it
+ * publishes its own duplicated thread handle in loop_thread (under the
+ * pipe's thread_lock), and a queued kicker work item issues
+ * CancelSynchronousIo against it until the handle is withdrawn. target
+ * caches the duplicated handle (THREAD_TERMINATE access), revalidated
+ * against target_tid in case uv_run() moved to another thread; active is
+ * nonzero while a kicker work item is live. */
+struct uv__pipe_kicker_state_s {
+  HANDLE target;
+  volatile HANDLE loop_thread;
+  DWORD target_tid;
+  volatile LONG active;
+};
+
 #define uv_pipe_connection_fields                                             \
   uv_timer_t* eof_timer;                                                      \
-  /* TODO: This is here for ABI compat - remove in 2.x. */                    \
-  uintptr_t dummy[sizeof(uv_write_t) / sizeof(uintptr_t) - 2];                \
+  /* Carved out of the ABI padding below, whose size shrinks by exactly     \
+   * the bytes the struct occupies. */                                        \
+  struct uv__pipe_kicker_state_s kicker;                                      \
+  /* TODO: This padding is here for ABI compat - remove in 2.x. */            \
+  uintptr_t dummy[sizeof(uv_write_t) / sizeof(uintptr_t) - 2 -                \
+                  sizeof(struct uv__pipe_kicker_state_s) /                    \
+                      sizeof(uintptr_t)];                                     \
   uv_write_t* non_overlapped_write_active;                                    \
   volatile HANDLE writefile_thread_handle;                                    \
   DWORD ipc_remote_pid;                                                       \

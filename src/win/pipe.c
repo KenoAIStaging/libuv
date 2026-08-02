@@ -83,6 +83,14 @@ typedef struct {
 STATIC_ASSERT(sizeof(uv__ipc_frame_header_t) == 16);
 STATIC_ASSERT(sizeof(uv__ipc_socket_xfer_info_t) == 632);
 
+/* The read-state members carved out of the ABI-compatibility padding must
+ * exactly fill the bytes they took from it: the offsets of the pre-existing
+ * members that follow the padding may not move. */
+STATIC_ASSERT(offsetof(uv_pipe_t, pipe.conn.non_overlapped_write_active) ==
+              offsetof(uv_pipe_t, pipe.conn.eof_timer) + sizeof(uv_timer_t*) +
+              (sizeof(uv_write_t) / sizeof(uintptr_t) - 2) *
+                  sizeof(uintptr_t));
+
 static void eof_timer_init(uv_pipe_t* pipe);
 static void eof_timer_start(uv_pipe_t* pipe);
 static void eof_timer_stop(uv_pipe_t* pipe);
@@ -570,6 +578,7 @@ static int uv__set_pipe_handle(uv_loop_t* loop,
     handle->pipe.conn.non_overlapped_write_active = NULL;
     handle->pipe.conn.readfile_thread_handle = INVALID_HANDLE_VALUE;
     handle->pipe.conn.writefile_thread_handle = INVALID_HANDLE_VALUE;
+    memset(&handle->pipe.conn.kicker, 0, sizeof(handle->pipe.conn.kicker));
     InitializeCriticalSection(&handle->pipe.conn.thread_lock);
   } else {
     /* Overlapped pipe. Try to associate with IOCP.
@@ -725,8 +734,16 @@ void uv__pipe_endgame(uv_loop_t* loop, uv_pipe_t* handle) {
       handle->read_req.event_handle = NULL;
     }
 
-    if (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE)
+    if (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE) {
+      /* No kicker work item can be live here: one only runs while the loop
+       * thread is inside a data ReadFile on this pipe. */
+      assert(handle->pipe.conn.kicker.active == 0);
+      if (handle->pipe.conn.kicker.target != NULL) {
+        CloseHandle(handle->pipe.conn.kicker.target);
+        handle->pipe.conn.kicker.target = NULL;
+      }
       DeleteCriticalSection(&handle->pipe.conn.thread_lock);
+    }
   }
 
   if (handle->flags & UV_HANDLE_PIPESERVER) {
@@ -1515,6 +1532,160 @@ static void uv__pipe_end_synchronous_io(volatile HANDLE* thread_ptr,
 }
 
 
+/* The "kicker": the publish/cancel protocol above run in the opposite
+ * direction, guarding the bounded data reads of pipes in non-overlapped
+ * mode. Here it is the LOOP thread that may block, in a data ReadFile
+ * sized from a PeekNamedPipe estimate that a peer's write retraction can
+ * invalidate (see uv__pipe_read_data_sync), and a thread pool work item is
+ * canceller, kicking through the same uv__pipe_kick_synchronous_io
+ * primitive that uv__pipe_cancel_synchronous_io uses.
+ *
+ * Two invariants:
+ *
+ * - Kicks may land only while the loop thread is inside that one data
+ *   ReadFile. The loop thread performs no other synchronous I/O between
+ *   uv__pipe_read_kicker_arm() and uv__pipe_read_kicker_disarm(), and a
+ *   kick issued while it is not inside a cancellable syscall at all fails
+ *   with ERROR_NOT_FOUND, which is harmless.
+ *
+ * - uv__pipe_read_kicker_disarm() returns only after the kicker work item
+ *   has exited, so that no stray kick can outlive the guarded region and
+ *   land on whatever synchronous I/O the loop thread - or a user callback
+ *   running on it - performs next. The waits used for that (a critical
+ *   section and WaitOnAddress) are not cancellable I/O, so the disarm
+ *   handshake itself cannot be kicked.
+ *
+ * The kicker waits ~1ms (nominal; subject to system timer resolution)
+ * between kicks, and only kicks after a full wait has elapsed with the
+ * loop thread still inside the read. A read that returns without blocking
+ * therefore completes unkicked - the fast path costs one work item and
+ * one wake, no cancellation - while a read that blocked on retracted
+ * bytes is freed within about a millisecond. */
+static DWORD WINAPI uv_pipe_read_kicker_thread_proc(void* arg) {
+  uv_pipe_t* handle = (uv_pipe_t*) arg;
+  volatile HANDLE* target_ptr =
+      &handle->pipe.conn.kicker.loop_thread;
+  CRITICAL_SECTION* lock = &handle->pipe.conn.thread_lock;
+  HANDLE target;
+
+  assert(handle->type == UV_NAMED_PIPE);
+  assert(handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE);
+
+  for (;;) {
+    /* (Re)read the slot; NULL means withdrawn. The first round never
+     * kicks: a read that returns promptly is disarmed before the cadence
+     * wait below elapses and is never cancelled. */
+    EnterCriticalSection(lock);
+    target = *target_ptr;
+    LeaveCriticalSection(lock);
+    if (target == NULL)
+      break;
+
+    /* Wait out the kick cadence; a withdraw wakes this immediately. */
+    WaitOnAddress((volatile VOID*) target_ptr, &target, sizeof(HANDLE), 1);
+
+    /* Claim the slot and kick whatever is still published. */
+    EnterCriticalSection(lock);
+    target = uv__pipe_kick_synchronous_io(target_ptr);
+    LeaveCriticalSection(lock);
+    if (target == NULL)
+      break;
+  }
+
+  /* Last act: announce exit and wake a disarm that is waiting for it. */
+  InterlockedExchange(&handle->pipe.conn.kicker.active, 0);
+  WakeByAddressSingle((PVOID) &handle->pipe.conn.kicker.active);
+  return 0;
+}
+
+
+/* Publish the loop thread as the CancelSynchronousIo target and queue the
+ * kicker. Called on the loop thread, immediately before the guarded data
+ * ReadFile. Returns ERROR_SUCCESS if armed; on failure nothing is armed
+ * and the caller must not issue a read that could block. */
+static DWORD uv__pipe_read_kicker_arm(uv_pipe_t* handle) {
+  CRITICAL_SECTION* lock = &handle->pipe.conn.thread_lock;
+  HANDLE target;
+  DWORD tid;
+
+  assert(handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE);
+  assert(handle->pipe.conn.kicker.active == 0);
+  assert(handle->pipe.conn.kicker.loop_thread == NULL);
+
+  /* CancelSynchronousIo requires a real thread handle with THREAD_TERMINATE
+   * access; the pseudo-handle from GetCurrentThread() does not work across
+   * threads. Cache the duplicated handle on the pipe, but revalidate the
+   * thread id every time: uv_run() may legally be driven from a different
+   * thread than last time. */
+  tid = GetCurrentThreadId();
+  if (handle->pipe.conn.kicker.target != NULL &&
+      handle->pipe.conn.kicker.target_tid != tid) {
+    CloseHandle(handle->pipe.conn.kicker.target);
+    handle->pipe.conn.kicker.target = NULL;
+  }
+  if (handle->pipe.conn.kicker.target == NULL) {
+    if (!DuplicateHandle(GetCurrentProcess(),
+                         GetCurrentThread(),
+                         GetCurrentProcess(),
+                         &target,
+                         THREAD_TERMINATE,
+                         FALSE,
+                         0)) {
+      return GetLastError();
+    }
+    handle->pipe.conn.kicker.target = target;
+    handle->pipe.conn.kicker.target_tid = tid;
+  }
+
+  EnterCriticalSection(lock);
+  handle->pipe.conn.kicker.loop_thread =
+      handle->pipe.conn.kicker.target;
+  LeaveCriticalSection(lock);
+
+  InterlockedExchange(&handle->pipe.conn.kicker.active, 1);
+  if (!QueueUserWorkItem(uv_pipe_read_kicker_thread_proc,
+                         handle,
+                         WT_EXECUTELONGFUNCTION)) {
+    DWORD err = GetLastError();
+    InterlockedExchange(&handle->pipe.conn.kicker.active, 0);
+    EnterCriticalSection(lock);
+    handle->pipe.conn.kicker.loop_thread = NULL;
+    LeaveCriticalSection(lock);
+    return err;
+  }
+
+  return ERROR_SUCCESS;
+}
+
+
+/* Withdraw the published thread handle and synchronize with the kicker's
+ * exit. Called on the loop thread, immediately after the guarded ReadFile
+ * returns (with data, a partial count, or ERROR_OPERATION_ABORTED). Only
+ * after this returns may the loop thread perform other synchronous I/O or
+ * enter any user callback. */
+static void uv__pipe_read_kicker_disarm(uv_pipe_t* handle) {
+  CRITICAL_SECTION* lock = &handle->pipe.conn.thread_lock;
+  LONG active = 1;
+
+  EnterCriticalSection(lock);
+  assert(handle->pipe.conn.kicker.loop_thread ==
+         handle->pipe.conn.kicker.target);
+  handle->pipe.conn.kicker.loop_thread = NULL;
+  LeaveCriticalSection(lock);
+  WakeByAddressSingle(
+      (PVOID) &handle->pipe.conn.kicker.loop_thread);
+
+  /* A kick issued between the withdraw above and the kicker noticing it
+   * can only land here, and this wait is not cancellable I/O. */
+  while (handle->pipe.conn.kicker.active != 0)
+    WaitOnAddress(
+        (volatile VOID*) &handle->pipe.conn.kicker.active,
+        &active,
+        sizeof(LONG),
+        INFINITE);
+}
+
+
 static DWORD WINAPI uv_pipe_zero_readfile_thread_proc(void* arg) {
   uv_read_t* req = (uv_read_t*) arg;
   uv_pipe_t* handle = (uv_pipe_t*) req->data;
@@ -1644,6 +1815,13 @@ static void uv__pipe_queue_read(uv_loop_t* loop, uv_pipe_t* handle) {
   req = &handle->read_req;
 
   if (handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE) {
+    /* Reset the request's completion state before handing it to a worker:
+     * the OVERLAPPED structure of a worker-driven read is not kernel-owned,
+     * so a stale success status from a previous read would otherwise make
+     * HasOverlappedIoCompleted()-based checks (such as the EOF timer's)
+     * believe the read had already finished. */
+    req->u.io.overlapped.Internal = STATUS_PENDING;
+    req->u.io.overlapped.InternalHigh = 0;
     assert(handle->pipe.conn.readfile_thread_handle == INVALID_HANDLE_VALUE);
     handle->pipe.conn.readfile_thread_handle = NULL; /* Reset cancellation. */
     if (!QueueUserWorkItem(&uv_pipe_zero_readfile_thread_proc,
@@ -2178,7 +2356,28 @@ static DWORD uv__pipe_read_exactly(uv_pipe_t* handle, void* buffer, DWORD count)
 
 /* Read data from a pipe in non-overlapped mode. Such pipes cannot carry an
  * overlapped read, so the data is pulled with a blocking loop-thread
- * ReadFile bounded by a PeekNamedPipe estimate. */
+ * ReadFile bounded by a PeekNamedPipe estimate. The estimate is inherently
+ * race-y - and not only because the peer may consume or produce
+ * concurrently: the named pipe file system serves reads for a peer's
+ * in-flight (pended) large write directly from the peer's buffer and
+ * counts those bytes in the peek, and if the peer then cancels that
+ * write, the advertised-but-unread bytes are retracted. A blocking
+ * ReadFile sized from the stale peek does not fail in that case; it
+ * blocks, with the pipe open and healthy, until unrelated new data
+ * arrives - wedging the loop, or deadlocking outright if the write end
+ * is driven by the same loop. Since uv_write() requests can be cancelled
+ * with uv_cancel(), this is straightforward to hit.
+ *
+ * The mode of a pipe end is set at creation and non-overlapped handles
+ * cannot carry a pending read, so the race cannot be avoided; instead
+ * the ReadFile runs under the reverse CancelSynchronousIo guard (see
+ * uv_pipe_read_kicker_thread_proc): if the read did block, the kicker
+ * frees it within ~1ms and the peek is simply retried. Byte-mode reads
+ * block only when no byte at all is available, so a kicked-out read that
+ * had already copied data reports the partial count, which is a normal
+ * byte-stream delivery; an empty kicked-out read re-peeks, and finding
+ * the pipe dry falls back to the zero-read doorbell. alloc_cb runs after
+ * the peek, once data is known to be available. */
 static int uv__pipe_read_data_sync(uv_loop_t* loop,
                                    uv_pipe_t* handle,
                                    DWORD* bytes_read, /* inout argument */
@@ -2186,51 +2385,102 @@ static int uv__pipe_read_data_sync(uv_loop_t* loop,
   uv_buf_t buf;
   DWORD r;
   DWORD bytes_available;
+  DWORD req_bytes;
+  DWORD suggested_bytes;
   int more;
 
   assert(handle->flags & UV_HANDLE_NON_OVERLAPPED_PIPE);
 
-  /* Ask the user for a buffer to read data into. */
+  suggested_bytes = *bytes_read;
   buf = uv_buf_init(NULL, 0);
-  handle->alloc_cb((uv_handle_t*) handle, *bytes_read, &buf);
-  if (buf.base == NULL || buf.len == 0) {
-    handle->read_cb((uv_stream_t*) handle, UV_ENOBUFS, &buf);
-    return 0; /* Break out of read loop. */
-  }
+  *bytes_read = 0;
+  more = 0;
 
-  /* Ensure we read at most the smaller of:
-   *   (a) the length of the user-allocated buffer.
-   *   (b) the maximum data length as specified by the `max_bytes` argument.
-   *   (c) the amount of data that can be read non-blocking.
-   *   (d) UV__IO_MAX_BYTES.
-   */
-  if (buf.len > UV__IO_MAX_BYTES)
-    buf.len = UV__IO_MAX_BYTES;
-  if (max_bytes > buf.len)
-    max_bytes = buf.len;
+  for (;;) {
+    /* Estimate the amount of data that can be read without blocking; only
+     * ever a hint (see above). */
+    bytes_available = 0;
+    if (!PeekNamedPipe(handle->handle, NULL, 0, NULL, &bytes_available,
+                       NULL)) {
+      r = GetLastError();
+      break;
+    }
 
-  /* The user failed to supply a pipe that can be used non-blocking or with
-   * threads. Try to estimate the amount of data that is safe to read without
-   * blocking, in a race-y way however. */
-  bytes_available = 0;
-  if (!PeekNamedPipe(handle->handle, NULL, 0, NULL, &bytes_available, NULL)) {
-    r = GetLastError();
-  } else {
-    if (max_bytes > bytes_available)
-      max_bytes = bytes_available;
+    if (bytes_available == 0) {
+      /* Pipe dry: nothing can be read without blocking indefinitely. The
+       * caller falls back to the doorbell; a buffer already obtained for
+       * a read that was kicked out empty is handed back below. */
+      r = ERROR_SUCCESS;
+      *bytes_read = 0;
+      break;
+    }
+
+    /* Ask the user for a buffer to read data into. A buffer from a
+     * previous iteration - its read was kicked out empty - is reused. */
+    if (buf.base == NULL) {
+      handle->alloc_cb((uv_handle_t*) handle, suggested_bytes, &buf);
+      if (buf.base == NULL || buf.len == 0) {
+        handle->read_cb((uv_stream_t*) handle, UV_ENOBUFS, &buf);
+        return 0; /* Break out of read loop. */
+      }
+      if (buf.len > UV__IO_MAX_BYTES)
+        buf.len = UV__IO_MAX_BYTES;
+      if (max_bytes > buf.len)
+        max_bytes = buf.len;
+    }
+
+    req_bytes = max_bytes;
+    if (req_bytes > bytes_available)
+      req_bytes = bytes_available;
+
+    /* The bounded read below may block despite the peek (see above); no
+     * other synchronous I/O and no user callback may run on this thread
+     * between arm and disarm. */
+    r = uv__pipe_read_kicker_arm(handle);
+    if (r != ERROR_SUCCESS)
+      break;
+
     *bytes_read = 0;
-    if (max_bytes == 0 || ReadFile(handle->handle, buf.base, max_bytes, bytes_read, NULL))
+    if (ReadFile(handle->handle, buf.base, req_bytes, bytes_read, NULL))
       r = ERROR_SUCCESS;
     else
       r = GetLastError();
-  }
-  more = max_bytes < bytes_available;
 
-  /* Call the read callback. */
-  if (r == ERROR_SUCCESS || r == ERROR_OPERATION_ABORTED)
-    handle->read_cb((uv_stream_t*) handle, *bytes_read, &buf);
-  else
+    /* Withdraw and synchronize with the kicker's exit before anything
+     * else runs on this thread - in particular before read_cb, which may
+     * itself perform synchronous I/O that a stray kick must never
+     * reach. */
+    uv__pipe_read_kicker_disarm(handle);
+
+    if (r == ERROR_OPERATION_ABORTED) {
+      if (*bytes_read == 0) {
+        /* The kicker freed this thread from a read that blocked because
+         * the peeked bytes were retracted before the read claimed them.
+         * Re-peek: either different data has arrived by now, or the pipe
+         * is dry and the doorbell takes over. */
+        continue;
+      }
+      /* A kick landed while the read was copying; it reports the partial
+       * count. The bytes were consumed from the pipe, so they are
+       * delivered - consumed bytes are never dropped. */
+      r = ERROR_SUCCESS;
+      break;
+    }
+
+    if (r == ERROR_SUCCESS)
+      more = *bytes_read < bytes_available;
+    break;
+  }
+
+  /* Call the read callback. If the pipe was dry before a buffer was ever
+   * requested, there is neither data nor a buffer to hand back, and no
+   * callback is due. */
+  if (r == ERROR_SUCCESS) {
+    if (buf.base != NULL)
+      handle->read_cb((uv_stream_t*) handle, *bytes_read, &buf);
+  } else {
     uv__pipe_read_error_or_eof(loop, handle, r, buf);
+  }
 
   return more;
 }
